@@ -7,22 +7,25 @@ import {
   CheckCircle2,
   Loader2,
   ArrowLeft,
+  AlertCircle,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+import { uploadPDF, extractPDF } from "../services/api";
 
 export default function NovoOrcamento() {
   const navigate = useNavigate();
   const [file, setFile] = useState<File | null>(null);
   const [uploadStatus, setUploadStatus] = useState<
-    "idle" | "uploading" | "success"
+    "idle" | "uploading" | "success" | "error"
   >("idle");
+  const [errorMessage, setErrorMessage] = useState<string>("");
 
   // Configuração do Dropzone
   const onDrop = useCallback((acceptedFiles: File[]) => {
-    // Aceita apenas o primeiro arquivo
     if (acceptedFiles && acceptedFiles.length > 0) {
       setFile(acceptedFiles[0]);
       setUploadStatus("idle");
+      setErrorMessage("");
     }
   }, []);
 
@@ -35,30 +38,51 @@ export default function NovoOrcamento() {
     multiple: false,
   } as unknown as DropzoneOptions);
 
-  // Função para remover o arquivo caso o usuário tenha errado
+  // Remover arquivo
   const removeFile = (e: React.MouseEvent) => {
-    e.stopPropagation(); // Evita reabrir a janela de seleção
+    e.stopPropagation();
     setFile(null);
     setUploadStatus("idle");
+    setErrorMessage("");
   };
 
-  // Simulação do envio para o backend
-  const handleUpload = () => {
+  // Upload real com backend
+  const handleUpload = async () => {
     if (!file) return;
 
     setUploadStatus("uploading");
+    setErrorMessage("");
 
-    // Aqui entraria sua chamada de API real (fetch/axios)
-    setTimeout(() => {
+    try {
+      // Step 1: Upload do arquivo
+      console.log("📤 Enviando arquivo para backend...");
+      const uploadResponse = await uploadPDF(file);
+      const uploadId = uploadResponse.upload_id;
+      console.log("✅ Upload bem-sucedido! ID:", uploadId);
+
+      // Step 2: Extração de dados
+      console.log("📊 Extraindo dados do PDF...");
+      const extractResponse = await extractPDF(uploadId);
+      console.log("✅ Extração bem-sucedida!");
+      console.log("Tabelas encontradas:", extractResponse.tables_found);
+
       setUploadStatus("success");
 
-      // --- MUDANÇA AQUI: Redirecionar após o sucesso ---
-      // Aguarda 1.5s para o usuário ver o check verde e navega
+      // Navegar com dados extraídos
       setTimeout(() => {
-        navigate("/validacao", { state: { file } });
+        navigate("/validacao", {
+          state: {
+            file,
+            uploadId,
+            extractedData: extractResponse.tables,
+          },
+        });
       }, 1500);
-      
-    }, 2000);
+    } catch (error: any) {
+      console.error("❌ Erro:", error.message);
+      setUploadStatus("error");
+      setErrorMessage(error.message || "Erro ao processar arquivo");
+    }
   };
 
   return (
@@ -67,7 +91,7 @@ export default function NovoOrcamento() {
       <div className="w-full max-w-2xl mb-6">
         <button
           onClick={() => navigate(-1)}
-          className="flex items-center text-sm text-slate-500 hover:text-slate-800 transition"
+          className="flex items-center text-sm text-slate-500 hover:text-slate-800 transition cursor-pointer"
         >
           <ArrowLeft className="w-4 h-4 mr-1" /> Voltar
         </button>
@@ -145,16 +169,20 @@ export default function NovoOrcamento() {
                 <div className="flex items-center justify-between mb-2">
                   <span
                     className={`text-sm font-medium flex items-center gap-2 
-                    ${uploadStatus === "success" ? "text-emerald-600" : "text-blue-600"}`}
+                    ${uploadStatus === "success" ? "text-emerald-600" : uploadStatus === "error" ? "text-red-600" : "text-blue-600"}`}
                   >
                     {uploadStatus === "uploading" ? (
                       <>
                         <Loader2 className="w-4 h-4 animate-spin" /> Processando
                         arquivo...
                       </>
-                    ) : (
+                    ) : uploadStatus === "success" ? (
                       <>
                         <CheckCircle2 className="w-4 h-4" /> Upload concluído!
+                      </>
+                    ) : (
+                      <>
+                        <AlertCircle className="w-4 h-4" /> Erro no upload
                       </>
                     )}
                   </span>
@@ -162,6 +190,11 @@ export default function NovoOrcamento() {
                 {uploadStatus === "uploading" && (
                   <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
                     <div className="h-full bg-blue-600 animate-pulse w-2/3 rounded-full"></div>
+                  </div>
+                )}
+                {uploadStatus === "error" && errorMessage && (
+                  <div className="mt-2 p-2 bg-red-50 border border-red-200 rounded text-sm text-red-700">
+                    {errorMessage}
                   </div>
                 )}
               </div>
@@ -172,7 +205,7 @@ export default function NovoOrcamento() {
           <button
             onClick={handleUpload}
             disabled={uploadStatus !== "idle"}
-            className={`mt-6 w-full py-3 px-4 rounded-xl font-medium text-white transition flex items-center justify-center gap-2
+            className={`mt-6 w-full py-3 px-4 rounded-xl font-medium text-white transition flex items-center justify-center gap-2 cursor-pointer
               ${
                 uploadStatus === "success"
                   ? "bg-emerald-600 hover:bg-emerald-700"

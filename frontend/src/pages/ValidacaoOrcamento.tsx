@@ -101,7 +101,7 @@ export default function ValidacaoOrcamento() {
       {/* HEADER */}
       <header className="h-16 border-b border-gray-200 px-6 flex items-center justify-between bg-white shrink-0 z-20 shadow-sm">
         <div className="flex items-center gap-4">
-          <button onClick={() => navigate(-1)} className="p-2 hover:bg-gray-100 rounded-full text-gray-500 transition">
+          <button onClick={() => navigate(-1)} className="p-2 hover:bg-gray-100 rounded-full text-gray-500 transition cursor-pointer">
             <ArrowLeft className="w-5 h-5" />
           </button>
           <div>
@@ -113,10 +113,10 @@ export default function ValidacaoOrcamento() {
         </div>
         <div className="flex items-center gap-3">
           <button 
-            className="bg-[#0F52BA] hover:bg-blue-800 text-white px-5 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition shadow-sm"
+            className="bg-[#0F52BA] hover:bg-blue-800 text-white px-5 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition shadow-sm cursor-pointer"
             onClick={() => alert(`Dados confirmados! Total: R$ ${formatMoney(totalGeral)}`)}
           >
-            <Check className="w-4 h-4" />
+            <Check className="w-4 h-4 " />
             Confirmar
           </button>
         </div>
@@ -135,16 +135,16 @@ export default function ValidacaoOrcamento() {
             <div className="flex items-center gap-2">
               <button 
                 onClick={() => setScale(s => Math.max(0.5, s - 0.1))}
-                className="p-1.5 hover:bg-gray-100 rounded text-gray-600" title="Diminuir Zoom"
+                className="p-1.5 hover:bg-gray-100 rounded text-gray-600 cursor-pointer"  title="Diminuir Zoom"
               >
                 <ZoomOut className="w-4 h-4" />
               </button>
               <span className="text-xs font-mono w-12 text-center text-gray-600">{(scale * 100).toFixed(0)}%</span>
               <button 
                 onClick={() => setScale(s => Math.min(2.0, s + 0.1))}
-                className="p-1.5 hover:bg-gray-100 rounded text-gray-600" title="Aumentar Zoom"
+                className="p-1.5 hover:bg-gray-100 rounded text-gray-600 cursor-pointer" title="Aumentar Zoom"
               >
-                <ZoomIn className="w-4 h-4" />
+                <ZoomIn className="w-4 h-4 cursor-pointer" />
               </button>
             </div>
 
@@ -290,7 +290,7 @@ export default function ValidacaoOrcamento() {
                         onClick={() => handleDelete(item.id)}
                         className="text-gray-300 hover:text-red-500 transition p-1 rounded hover:bg-red-50"
                       >
-                        <Trash2 className="w-4 h-4" />
+                        <Trash2 className="w-4 h-4 cursor-pointer" />
                       </button>
                     </td>
                   </tr>

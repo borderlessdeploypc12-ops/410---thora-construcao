@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+.env
+firebase-key.json
+uploads/
+temp/
+.DS_Store
+*.log
+.vscode/
+.idea/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
