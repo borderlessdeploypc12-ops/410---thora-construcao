@@ -315,9 +315,19 @@ export default function ValidacaoOrcamento() {
           <button
             disabled={isLoading || items.length === 0}
             className="bg-[#0F52BA] hover:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition shadow-sm cursor-pointer"
-            onClick={() =>
-              alert(`Dados confirmados! Total: R$ ${formatMoney(totalGeral)}`)
-            }
+            onClick={() => {
+              if (items.length === 0) {
+                alert("⚠️ Adicione pelo menos um item antes de continuar");
+                return;
+              }
+              const uploadId = location.state?.uploadId || "unknown";
+              navigate(`/curva-abc/${uploadId}`, {
+                state: {
+                  items,
+                  uploadId,
+                },
+              });
+            }}
           >
             <Check className="w-4 h-4 " />
             Confirmar

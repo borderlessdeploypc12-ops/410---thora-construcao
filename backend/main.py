@@ -13,6 +13,7 @@ from config import (
     UPLOAD_FOLDER,
     MAX_FILE_SIZE,
 )
+from firebase_service import OrcamentoFirestore
 
 try:
     import pdfplumber
@@ -121,6 +122,7 @@ async def upload_pdf(file: UploadFile = File(...)):
 async def extract_pdf(upload_id: str):
     """
     Extrai tabelas do PDF usando pdfplumber
+    Salva dados no Firestore e deleta arquivo PDF
     
     Args:
         upload_id: ID retornado pelo endpoint /api/upload
@@ -129,14 +131,9 @@ async def extract_pdf(upload_id: str):
         {
             "status": "success",
             "upload_id": "uuid",
+            "document_id": "firestore_doc_id",
             "tables_found": 1,
-            "tables": [
-                {
-                    "page": 1,
-                    "table_id": "page_0_table_0",
-                    "rows": [...]
-                }
-            ]
+            "tables": [...]
         }
     """
     try:
@@ -155,6 +152,7 @@ async def extract_pdf(upload_id: str):
             )
         
         file_path = files[0]
+        filename = file_path.name
         
         # Extrair tabelas
         tables = []
@@ -178,12 +176,34 @@ async def extract_pdf(upload_id: str):
         
         logger.info(f"✅ {len(tables)} tabela(s) extraída(s) de {file_path}")
         
+        # Salvar no Firestore
+        try:
+            doc_id = OrcamentoFirestore.save_orcamento(
+                upload_id=upload_id,
+                filename=filename,
+                tables=tables,
+            )
+            logger.info(f"✅ Dados salvos no Firestore: {doc_id}")
+        except Exception as e:
+            logger.error(f"❌ Erro ao salvar no Firestore: {str(e)}")
+            # Continuar mesmo se Firestore falhar, dados extraídos ainda serão retornados
+            doc_id = None
+        
+        # Deletar arquivo PDF
+        try:
+            file_path.unlink()
+            logger.info(f"🗑️  PDF deletado: {file_path}")
+        except Exception as e:
+            logger.warning(f"⚠️  Erro ao deletar PDF: {str(e)}")
+        
         return {
             "status": "success",
             "upload_id": upload_id,
-            "filename": file_path.name,
+            "document_id": doc_id,
+            "filename": filename,
             "tables_found": len(tables),
             "tables": tables,
+            "message": "✅ Dados extraídos e persistidos com sucesso"
         }
     
     except HTTPException:
@@ -195,6 +215,70 @@ async def extract_pdf(upload_id: str):
             detail=str(e),
         )
 
+# ============== FIRESTORE OPERATIONS ==============
+
+@app.get("/api/orcamentos")
+async def list_orcamentos():
+    """
+    Listar todos os orçamentos salvos no Firestore
+    
+    Returns:
+        {
+            "status": "success",
+            "count": 5,
+            "orcamentos": [...]
+        }
+    """
+    try:
+        orcamentos = OrcamentoFirestore.list_all_orcamentos()
+        return {
+            "status": "success",
+            "count": len(orcamentos),
+            "orcamentos": orcamentos,
+        }
+    except Exception as e:
+        logger.error(f"❌ Erro ao listar orçamentos: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao listar orçamentos: {str(e)}",
+        )
+
+@app.get("/api/orcamentos/{upload_id}")
+async def get_orcamento(upload_id: str):
+    """
+    Recuperar orçamento específico do Firestore
+    
+    Args:
+        upload_id: Upload ID
+    
+    Returns:
+        {
+            "status": "success",
+            "orcamento": {...}
+        }
+    """
+    try:
+        orcamento = OrcamentoFirestore.get_orcamento_by_upload_id(upload_id)
+        
+        if not orcamento:
+            raise HTTPException(
+                status_code=404,
+                detail=f"❌ Orçamento não encontrado: {upload_id}",
+            )
+        
+        return {
+            "status": "success",
+            "orcamento": orcamento,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erro ao recuperar orçamento: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao recuperar orçamento: {str(e)}",
+        )
+
 # ============== RUN ==============
 if __name__ == "__main__":
     import uvicorn
@@ -202,5 +286,5 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        reload=False,
     )

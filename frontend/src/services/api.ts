@@ -1,4 +1,9 @@
 import axios from "axios";
+import {
+  saveOrcamento,
+  getOrcamentoByUploadId,
+  getAllOrcamentos,
+} from "./firebase";
 
 const API_BASE = "http://localhost:8000";
 
@@ -8,6 +13,8 @@ export const apiClient = axios.create({
     "Content-Type": "application/json",
   },
 });
+
+// ==================== PDF OPERATIONS ====================
 
 // Upload PDF
 export const uploadPDF = async (file: File) => {
@@ -24,14 +31,84 @@ export const uploadPDF = async (file: File) => {
   }
 };
 
-// Extrair tabelas
+// Extrair tabelas e salvar no Firestore
 export const extractPDF = async (uploadId: string) => {
   try {
     const response = await apiClient.post("/api/extract", null, {
       params: { upload_id: uploadId },
     });
+
+    // Dados já foram salvos no backend/Firestore
     return response.data;
   } catch (error: any) {
     throw new Error(error.response?.data?.detail || "Erro ao extrair dados");
+  }
+};
+
+// ==================== FIRESTORE OPERATIONS ====================
+
+// Salvar orçamento no Firebase
+export const saveOrcamentoToFirebase = async (data: any) => {
+  try {
+    const docId = await saveOrcamento({
+      uploadId: data.uploadId,
+      filename: data.filename,
+      uploadedAt: new Date(),
+      items: data.items || [],
+      tablesFound: data.tablesFound || 0,
+      status: "completed",
+    });
+    return { success: true, documentId: docId };
+  } catch (error: any) {
+    console.error("Erro ao salvar no Firebase:", error);
+    throw error;
+  }
+};
+
+// Recuperar orçamento do Firebase
+export const getOrcamentoFromFirebase = async (uploadId: string) => {
+  try {
+    const orcamento = await getOrcamentoByUploadId(uploadId);
+    return orcamento;
+  } catch (error: any) {
+    console.error("Erro ao recuperar orçamento:", error);
+    throw error;
+  }
+};
+
+// Listar todos os orçamentos
+export const getAllOrcamentosFromFirebase = async () => {
+  try {
+    const orcamentos = await getAllOrcamentos();
+    return orcamentos;
+  } catch (error: any) {
+    console.error("Erro ao listar orçamentos:", error);
+    throw error;
+  }
+};
+
+// ==================== BACKEND OPERATIONS ====================
+
+// Listar orçamentos via backend
+export const listOrcamentos = async () => {
+  try {
+    const response = await apiClient.get("/api/orcamentos");
+    return response.data;
+  } catch (error: any) {
+    throw new Error(
+      error.response?.data?.detail || "Erro ao listar orçamentos",
+    );
+  }
+};
+
+// Recuperar orçamento via backend
+export const getOrcamento = async (uploadId: string) => {
+  try {
+    const response = await apiClient.get(`/api/orcamentos/${uploadId}`);
+    return response.data;
+  } catch (error: any) {
+    throw new Error(
+      error.response?.data?.detail || "Erro ao recuperar orçamento",
+    );
   }
 };
