@@ -5,7 +5,7 @@ import {
   getAllOrcamentos,
 } from "./firebase";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = "https://four10-thora-construcao.onrender.com";
 
 export const apiClient = axios.create({
   baseURL: API_BASE,
