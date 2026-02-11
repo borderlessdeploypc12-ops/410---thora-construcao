@@ -1,9 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from datetime import datetime
 import uuid
 import logging
 from pathlib import Path
+from typing import List, Dict
 
 from config import (
     FRONTEND_URLS,
@@ -12,6 +15,8 @@ from config import (
     API_DESCRIPTION,
     UPLOAD_FOLDER,
     MAX_FILE_SIZE,
+    TEMP_FOLDER,
+    BASE_DIR,
 )
 from firebase_service import OrcamentoFirestore
 
@@ -19,6 +24,12 @@ try:
     import pdfplumber
 except ImportError:
     pdfplumber = None
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+except ImportError:
+    Workbook = None
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +50,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============== STATIC FILES (FRONTEND) ==============
+# Servir arquivos estáticos do frontend build
+FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
+if FRONTEND_DIST.exists():
+    logger.info(f"✅ Frontend dist encontrado: {FRONTEND_DIST}")
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets", check_dir=False), name="assets")
+else:
+    logger.warning(f"⚠️  Frontend dist não encontrado: {FRONTEND_DIST}")
 
 # ============== HEALTH CHECK ==============
 @app.get("/health")
@@ -278,6 +298,152 @@ async def get_orcamento(upload_id: str):
             status_code=500,
             detail=f"Erro ao recuperar orçamento: {str(e)}",
         )
+
+# ============== EXPORT XLSX ==============
+@app.post("/api/export-xlsx")
+async def export_xlsx(items: List[Dict]):
+    """
+    Exporta itens da planilha para arquivo XLSX
+    
+    Args:
+        items: Lista de itens [
+            {
+                "id": 1,
+                "code": "001",
+                "description": "Item",
+                "unit": "un",
+                "qty": 10,
+                "unitPrice": 100.00
+            }
+        ]
+    
+    Returns:
+        arquivo XLSX para download
+    """
+    try:
+        if not Workbook:
+            raise HTTPException(
+                status_code=500,
+                detail="openpyxl não está instalado",
+            )
+        
+        # Criar workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Orçamento"
+        
+        # Estilos
+        header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        total_fill = PatternFill(start_color="E8F4F8", end_color="E8F4F8", fill_type="solid")
+        total_font = Font(bold=True, size=11)
+        currency_fill = PatternFill(start_color="F0F8FF", end_color="F0F8FF", fill_type="solid")
+        
+        border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        
+        # Cabeçalho
+        headers = ["Código", "Descrição", "Unidade", "Quantidade", "Valor Unitário", "Total"]
+        for col_num, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num)
+            cell.value = header
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = border
+        
+        # Dados
+        total_geral = 0
+        for row_num, item in enumerate(items, 2):
+            ws.cell(row=row_num, column=1).value = item.get("code", "")
+            ws.cell(row=row_num, column=2).value = item.get("description", "")
+            ws.cell(row=row_num, column=3).value = item.get("unit", "")
+            
+            qty = float(item.get("qty", 0))
+            unit_price = float(item.get("unitPrice", 0))
+            total = qty * unit_price
+            total_geral += total
+            
+            ws.cell(row=row_num, column=4).value = qty
+            ws.cell(row=row_num, column=5).value = unit_price
+            ws.cell(row=row_num, column=6).value = total
+            
+            # Formato moeda para R$
+            ws.cell(row=row_num, column=5).number_format = 'R$ #,##0.00'
+            ws.cell(row=row_num, column=6).number_format = 'R$ #,##0.00'
+            ws.cell(row=row_num, column=6).fill = currency_fill
+            
+            # Bordas
+            for col in range(1, 7):
+                ws.cell(row=row_num, column=col).border = border
+                ws.cell(row=row_num, column=col).alignment = Alignment(horizontal="right" if col >= 4 else "left")
+        
+        # Linha de Total
+        total_row = len(items) + 3
+        ws.cell(row=total_row, column=5).value = "TOTAL GERAL:"
+        ws.cell(row=total_row, column=5).font = total_font
+        ws.cell(row=total_row, column=5).alignment = Alignment(horizontal="right")
+        
+        ws.cell(row=total_row, column=6).value = total_geral
+        ws.cell(row=total_row, column=6).number_format = 'R$ #,##0.00'
+        ws.cell(row=total_row, column=6).fill = total_fill
+        ws.cell(row=total_row, column=6).font = total_font
+        ws.cell(row=total_row, column=6).border = border
+        
+        # Ajustar largura das colunas
+        ws.column_dimensions['A'].width = 12
+        ws.column_dimensions['B'].width = 40
+        ws.column_dimensions['C'].width = 12
+        ws.column_dimensions['D'].width = 15
+        ws.column_dimensions['E'].width = 15
+        ws.column_dimensions['F'].width = 15
+        
+        # Altura do cabeçalho
+        ws.row_dimensions[1].height = 25
+        
+        # Salvar arquivo
+        filename = f"orcamento_{uuid.uuid4().hex[:8]}.xlsx"
+        file_path = TEMP_FOLDER / filename
+        wb.save(file_path)
+        
+        logger.info(f"✅ XLSX gerado: {file_path}")
+        
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erro ao exportar XLSX: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao gerar Excel: {str(e)}",
+        )
+
+# ============== SERVE FRONTEND INDEX (SPA FALLBACK) ==============
+@app.get("/{path_name:path}")
+async def serve_frontend(path_name: str):
+    """
+    Serve o frontend para rotas que não são API
+    Necessário para SPA (Single Page Application)
+    """
+    # Se é um arquivo com extensão (CSS, JS, etc), tentar servir como estático
+    if "." in path_name and not path_name.startswith("api"):
+        return {"error": "File not found"}
+    
+    # Servir index.html para rotas do frontend
+    index_path = FRONTEND_DIST / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
+    
+    return {"error": "Frontend not available"}
 
 # ============== RUN ==============
 if __name__ == "__main__":

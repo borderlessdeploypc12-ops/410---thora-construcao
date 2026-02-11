@@ -5,7 +5,20 @@ import {
   getAllOrcamentos,
 } from "./firebase";
 
-const API_BASE = "https://four10-thora-construcao.onrender.com";
+// Detectar URL da API
+// Em desenvolvimento: usar porta do Vite se houver, senão localhost:8000
+// Em produção: usar a mesma origem
+const getAPIBase = () => {
+  if (import.meta.env.DEV) {
+    // Desenvolvimento: tentar usar localhost:8000
+    return "http://localhost:8000";
+  } else {
+    // Produção: usar a mesma origem (útil se frontend e backend estão na mesma porta)
+    return window.location.origin;
+  }
+};
+
+const API_BASE = getAPIBase();
 
 export const apiClient = axios.create({
   baseURL: API_BASE,
@@ -110,5 +123,33 @@ export const getOrcamento = async (uploadId: string) => {
     throw new Error(
       error.response?.data?.detail || "Erro ao recuperar orçamento",
     );
+  }
+};
+
+// ==================== EXPORT OPERATIONS ====================
+
+// Exportar planilha para XLSX
+export const exportToXLSX = async (items: any[]) => {
+  try {
+    const response = await apiClient.post("/api/export-xlsx", items, {
+      responseType: "blob",
+    });
+
+    // Criar URL temporária e fazer download
+    const url = window.URL.createObjectURL(new Blob([response.data]));
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute(
+      "download",
+      `orcamento_${new Date().toISOString().split("T")[0]}.xlsx`
+    );
+    document.body.appendChild(link);
+    link.click();
+    link.parentNode?.removeChild(link);
+    window.URL.revokeObjectURL(url);
+
+    return { success: true, message: "✅ Arquivo exportado com sucesso!" };
+  } catch (error: any) {
+    throw new Error(error.response?.data?.detail || "Erro ao exportar arquivo");
   }
 };

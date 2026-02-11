@@ -11,7 +11,9 @@ import {
   ZoomIn,
   ZoomOut,
   Loader2,
+  Download,
 } from "lucide-react";
+import { exportToXLSX } from "../services/api";
 
 // --- CONFIGURAÇÃO OBRIGATÓRIA DO WORKER (PARA VITE) ---
 pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
@@ -45,6 +47,7 @@ export default function ValidacaoOrcamento() {
   const [totalGeral, setTotalGeral] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string>("");
+  const [isExporting, setIsExporting] = useState(false);
 
   // States do PDF Viewer
   const [pdfFile, setPdfFile] = useState<File | null>(null);
@@ -289,6 +292,25 @@ export default function ValidacaoOrcamento() {
     setNumPages(numPages);
   };
 
+  // Handler de Exportação XLSX
+  const handleExport = async () => {
+    if (items.length === 0) {
+      alert("⚠️ Adicione pelo menos um item antes de exportar");
+      return;
+    }
+
+    setIsExporting(true);
+    try {
+      await exportToXLSX(items);
+      alert("✅ Arquivo exportado com sucesso!");
+    } catch (error: any) {
+      console.error("❌ Erro ao exportar:", error);
+      alert("❌ Erro ao exportar arquivo: " + error.message);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-screen bg-white font-sans overflow-hidden">
       {/* HEADER */}
@@ -312,6 +334,15 @@ export default function ValidacaoOrcamento() {
           </div>
         </div>
         <div className="flex items-center gap-3">
+          <button
+            disabled={isLoading || items.length === 0 || isExporting}
+            className="bg-slate-600 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition shadow-sm cursor-pointer"
+            onClick={handleExport}
+            title="Exportar planilha em XLSX"
+          >
+            <Download className="w-4 h-4" />
+            {isExporting ? "Exportando..." : "Exportar"}
+          </button>
           <button
             disabled={isLoading || items.length === 0}
             className="bg-[#0F52BA] hover:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition shadow-sm cursor-pointer"
