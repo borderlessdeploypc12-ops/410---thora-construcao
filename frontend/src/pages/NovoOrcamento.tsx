@@ -17,6 +17,7 @@ export default function NovoOrcamento() {
   const [uploadStatus, setUploadStatus] = useState<
     "idle" | "uploading" | "success" | "error"
   >("idle");
+  const [uploadStep, setUploadStep] = useState<"upload" | "extract">("upload");
   const [errorMessage, setErrorMessage] = useState<string>("");
 
   // Configuração do Dropzone
@@ -50,6 +51,7 @@ export default function NovoOrcamento() {
     if (!file) return;
 
     setUploadStatus("uploading");
+    setUploadStep("upload");
     setErrorMessage("");
 
     try {
@@ -61,6 +63,7 @@ export default function NovoOrcamento() {
 
       // Step 2: Extração de dados
       console.log("📊 Extraindo dados do PDF...");
+      setUploadStep("extract");
       const extractResponse = await extractPDF(uploadId);
       console.log("✅ Extração bem-sucedida!");
       console.log("Tabelas encontradas:", extractResponse.tables_found);
@@ -162,8 +165,10 @@ export default function NovoOrcamento() {
                   >
                     {uploadStatus === "uploading" ? (
                       <>
-                        <Loader2 className="w-4 h-4 animate-spin" /> Processando
-                        arquivo...
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        {uploadStep === "upload"
+                          ? " Enviando arquivo..."
+                          : " Extraindo dados do PDF..."}
                       </>
                     ) : uploadStatus === "success" ? (
                       <>

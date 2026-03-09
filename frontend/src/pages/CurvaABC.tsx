@@ -35,6 +35,14 @@ interface Item {
   accumulated_percentage?: number;
 }
 
+type RawItem = Partial<Item> & {
+  id?: string | number;
+  description?: string;
+  unit?: string;
+  qty?: number;
+  unitPrice?: number;
+};
+
 const CurvaABC: React.FC = () => {
   const { uploadId } = useParams();
   const navigate = useNavigate();
@@ -47,6 +55,29 @@ const CurvaABC: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+
+  const toNumber = (value: unknown): number => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  };
+
+  const normalizeItem = (raw: RawItem, index: number): Item => {
+    const quantidade = toNumber(raw.quantidade ?? raw.qty);
+    const valorUnitario = toNumber(raw.valor_unitario ?? raw.unitPrice);
+    const valorTotal = toNumber(raw.valor_total ?? quantidade * valorUnitario);
+
+    return {
+      id: String(raw.id ?? index + 1),
+      descricao: String(raw.descricao ?? raw.description ?? "").trim(),
+      quantidade,
+      unidade: String(raw.unidade ?? raw.unit ?? "un").trim() || "un",
+      valor_unitario: valorUnitario,
+      valor_total: valorTotal,
+      status: (raw.status as Item["status"]) || "validado",
+      classification: raw.classification,
+      accumulated_percentage: toNumber(raw.accumulated_percentage),
+    };
+  };
 
   // Buscar dados reais da Curva ABC
   useEffect(() => {
@@ -62,11 +93,17 @@ const CurvaABC: React.FC = () => {
         setError(null);
         
         // Verificar se há items selecionados passados via location.state
-        const selectedItems = location.state?.items as Item[] | undefined;
+        const selectedItems = location.state?.items as RawItem[] | undefined;
         
         if (selectedItems && selectedItems.length > 0) {
           // Usar apenas os items selecionados e calcular classificação ABC
-          const sortedItems = [...selectedItems].sort((a, b) => b.valor_total - a.valor_total);
+          const normalizedSelectedItems = selectedItems.map((item, index) =>
+            normalizeItem(item, index),
+          );
+
+          const sortedItems = [...normalizedSelectedItems].sort(
+            (a, b) => b.valor_total - a.valor_total,
+          );
           const total = sortedItems.reduce((sum, item) => sum + item.valor_total, 0);
           
           let accumulated = 0;
@@ -92,7 +129,10 @@ const CurvaABC: React.FC = () => {
         } else {
           // Buscar todos os items da API
           const response = await getCurvaABC(uploadId);
-          setItems(response.items || []);
+          const normalizedApiItems = ((response.items || []) as RawItem[]).map(
+            (item, index) => normalizeItem(item, index),
+          );
+          setItems(normalizedApiItems);
         }
       } catch (err: any) {
         console.error("Erro ao buscar Curva ABC:", err);
@@ -456,7 +496,7 @@ const CurvaABC: React.FC = () => {
                       </td>
                       <td className="px-6 py-3 font-semibold text-slate-900">
                         R${" "}
-                        {item.valor_total.toLocaleString("pt-BR", {
+                        {Number(item.valor_total || 0).toLocaleString("pt-BR", {
                           minimumFractionDigits: 2,
                         })}
                       </td>
@@ -466,12 +506,12 @@ const CurvaABC: React.FC = () => {
                             <div
                               className="bg-blue-600 h-2 rounded-full"
                               style={{
-                                width: `${item.accumulated_percentage}%`,
+                                width: `${Number(item.accumulated_percentage || 0)}%`,
                               }}
                             />
                           </div>
                           <span className="text-sm text-slate-600">
-                            {item.accumulated_percentage}%
+                            {Number(item.accumulated_percentage || 0)}%
                           </span>
                         </div>
                       </td>

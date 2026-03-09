@@ -25,6 +25,7 @@ from config import (
     GEMINI_MODEL,
 )
 from firebase_service import OrcamentoFirestore
+from budget_parser import BudgetParser
 
 try:
     import pdfplumber
@@ -40,6 +41,66 @@ except ImportError:
 # Configuração de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_GEMINI_CANDIDATE_MODELS = [
+    GEMINI_MODEL,
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro-latest",
+    "gemini-pro",
+]
+
+
+async def _call_gemini_generate_content(request_body: dict, timeout_seconds: float = 45.0):
+    attempted_models = []
+    last_error_body = ""
+
+    models_to_try = []
+    for model in _GEMINI_CANDIDATE_MODELS:
+        if model and model not in models_to_try:
+            models_to_try.append(model)
+
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        for model in models_to_try:
+            attempted_models.append(model)
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                f"?key={GEMINI_API_KEY}"
+            )
+            response = await client.post(url, json=request_body)
+
+            if response.status_code < 400:
+                logger.info(f"✅ Gemini respondeu com modelo: {model}")
+                return response.json(), model
+
+            last_error_body = response.text
+            logger.warning(
+                f"⚠️ Gemini falhou com modelo {model} (status {response.status_code})."
+            )
+
+            if response.status_code == 404:
+                continue
+
+            if response.status_code == 429:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Quota da API do Gemini excedida. Aguarde alguns minutos ou troque a chave/modelo.",
+                )
+
+            raise HTTPException(
+                status_code=502,
+                detail=f"Erro na API do Gemini: {response.text}",
+            )
+
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            "Nenhum modelo Gemini compatível respondeu ao generateContent. "
+            f"Modelos tentados: {', '.join(attempted_models)}. "
+            f"Último erro: {last_error_body}"
+        ),
+    )
 
 # Cache em memória para modo offline (dados temporários)
 _OFFLINE_CACHE = {}
@@ -135,9 +196,6 @@ async def ai_standardize_items(payload: AIStandardizeRequest):
     }
 
     try:
-        # Usar API REST do Gemini
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        
         request_body = {
             "contents": [
                 {
@@ -153,26 +211,11 @@ async def ai_standardize_items(payload: AIStandardizeRequest):
                 "topP": 0.95,
             }
         }
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, json=request_body)
-        
-        if response.status_code >= 400:
-            logger.error(f"Erro Gemini: {response.text}")
-            
-            # Tratamento específico para erro de quota (429)
-            if response.status_code == 429:
-                raise HTTPException(
-                    status_code=429,
-                    detail="Quota da API do Gemini excedida. Aguarde alguns minutos ou configure uma nova chave de API com quota disponível. Para usar outro modelo, altere GEMINI_MODEL no arquivo .env (ex: gemini-1.5-flash)",
-                )
-            
-            raise HTTPException(
-                status_code=502,
-                detail=f"Erro na API do Gemini: {response.text}",
-            )
-        
-        response_data = response.json()
+
+        response_data, _model_used = await _call_gemini_generate_content(
+            request_body,
+            timeout_seconds=30.0,
+        )
         if "candidates" not in response_data or not response_data["candidates"]:
             raise ValueError("Resposta vazia do Gemini")
         
@@ -372,12 +415,21 @@ async def extract_pdf(upload_id: str):
         
         logger.info(f"✅ {len(tables)} tabela(s) extraída(s) de {file_path}")
         
+        # Parsear itens das tabelas usando parser inteligente
+        parser = BudgetParser()
+        parsed_data = parser.parse_all_tables(tables)
+        items = parsed_data.get('items', [])
+        resumo = parsed_data.get('resumo', {})
+        
+        logger.info(f"📊 Parser extraiu {len(items)} itens (confiança: {resumo.get('confianca', 0):.2f})")
+        
         # Salvar no Firestore
         try:
             doc_id = OrcamentoFirestore.save_orcamento(
                 upload_id=upload_id,
                 filename=filename,
                 tables=tables,
+                items_data={'items': items, 'resumo': resumo}
             )
             logger.info(f"✅ Dados salvos no Firestore: {doc_id}")
         except Exception as e:
@@ -390,9 +442,12 @@ async def extract_pdf(upload_id: str):
             "uploadId": upload_id,
             "filename": filename,
             "tables": tables,
+            "items": items,
+            "resumo": resumo,
             "uploadedAt": datetime.now().isoformat(),
             "extractedAt": datetime.now().isoformat(),
             "tablesFound": len(tables),
+            "itemsFound": len(items),
             "status": "completed"
         }
         logger.info(f"✅ Dados salvos em cache offline: {upload_id}")
@@ -410,8 +465,11 @@ async def extract_pdf(upload_id: str):
             "document_id": doc_id,
             "filename": filename,
             "tables_found": len(tables),
+            "items_found": len(items),
             "tables": tables,
-            "message": "✅ Dados extraídos e persistidos com sucesso"
+            "items": items,
+            "resumo": resumo,
+            "message": "✅ Dados extraídos e processados com sucesso"
         }
     
     except HTTPException:
@@ -421,6 +479,217 @@ async def extract_pdf(upload_id: str):
         raise HTTPException(
             status_code=500,
             detail=str(e),
+        )
+
+# ============== ANALYZE WITH AI ==============
+class AnalyzeWithAIRequest(BaseModel):
+    upload_id: str
+    focus: str = "budget"  # budget, items, structure, all
+
+@app.post("/api/analyze-with-ai")
+async def analyze_with_ai(payload: AnalyzeWithAIRequest):
+    """
+    Análise inteligente de dados extraídos com IA Gemini
+    
+    Usa IA para:
+    - Identificar estrutura de planilha orçamentária
+    - Reconhecer colunas (descrição, quantidade, unidade, valor)
+    - Filtrar linhas irrelevantes (subtotais, linhas em branco)
+    - Validar dados e sugerir correções
+    
+    Args:
+        upload_id: ID retornado pelo /api/upload
+        focus: Tipo de análise (budget, items, structure, all)
+    
+    Returns:
+        {
+            "status": "success",
+            "upload_id": "uuid",
+            "analysis": {
+                "structure": {...},
+                "items": [...],
+                "metadata": {...}
+            }
+        }
+    """
+    try:
+        if not GEMINI_API_KEY:
+            raise HTTPException(
+                status_code=503,
+                detail="Recurso de IA indisponível: chave do Gemini não configurada",
+            )
+        
+        # Buscar dados extraídos
+        upload_data = _OFFLINE_CACHE.get(payload.upload_id)
+        if not upload_data:
+            raise HTTPException(
+                status_code=404,
+                detail=f"❌ Dados extraídos não encontrados: {payload.upload_id}",
+            )
+        
+        tables = upload_data.get("tables", [])
+        if not tables:
+            raise HTTPException(
+                status_code=400,
+                detail="Nenhuma tabela encontrada para análise",
+            )
+        
+        # Preparar texto das tabelas para análise
+        tables_text = ""
+        for table in tables:
+            rows = table.get("rows", [])
+            table_text = "Página {}, Tabela: {} linhas x {} colunas\n".format(
+                table.get("page", "?"),
+                len(rows),
+                table.get("columns", "?")
+            )
+            for row in rows[:20]:  # Limitar a 20 linhas por tabela para análise
+                table_text += " | ".join(str(cell)[:40] for cell in row) + "\n"
+            tables_text += table_text + "\n---\n"
+        
+        # Payload para Gemini
+        system_message = """Você é um especialista em análise de orçamentos e planilhas de construção civil.
+Analise os dados extraídos de um PDF de orçamento e:
+1. Identifique a estrutura (quais colunas representam descrição, quantidade, unidade, valor)
+2. Extraia e valide os items orçamentários
+3. Filtre e descarte linhas irrelevantes (subtotais, totalizações, cabeçalhos duplicados, linhas em branco)
+4. Retorne apenas JSON estruturado com os dados validados
+
+Estrutura esperada de cada item:
+- descricao: string com descrição do serviço/material
+- quantidade: número (pode ter decimais)
+- unidade: string (un, m, m2, m3, kg, t, l, h, dia, etc)
+- valor_unitario: número em reais
+- valor_total: quantidade * valor_unitario
+
+Regras:
+- Descartar linhas onde descricao contém: "total", "subtotal", "suma", "resumen"
+- Descartar linhas que parecem ser títulos ou seções
+- Converter valores de string para número (remover R$, converter vírgula em ponto)
+- Manter apenas items que tenham pelo menos: descrição e um valor numérico"""
+        
+        user_message = {
+            "tarefa": "analisar_orcamento",
+            "dados_extraidos": tables_text,
+            "requisitos": {
+                "validar_estrutura": True,
+                "filtrar_linhas_invalidas": True,
+                "identificar_colunas": True,
+                "extrair_items": True
+            },
+            "formato_retorno": {
+                "structure": {
+                    "coluna_descricao": 0,
+                    "coluna_quantidade": 1,
+                    "coluna_unidade": 2,
+                    "coluna_valor_unitario": 3,
+                    "confianca": 0.95
+                },
+                "items": [
+                    {
+                        "id": "item_1",
+                        "descricao": "descrição do item",
+                        "quantidade": 10.0,
+                        "unidade": "un",
+                        "valor_unitario": 100.50,
+                        "valor_total": 1005.0,
+                        "validado": True,
+                        "notas": ""
+                    }
+                ],
+                "resumo": {
+                    "total_items": 0,
+                    "valor_total": 0.0,
+                    "confianca_analise": 0.95,
+                    "avisos": []
+                }
+            }
+        }
+        
+        request_body = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": system_message},
+                        {"text": json.dumps(user_message, ensure_ascii=False)}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.2,  # Baixa temperatura para respostas mais determinísticas
+                "topK": 40,
+                "topP": 0.95,
+                "maxOutputTokens": 4000,
+            }
+        }
+
+        logger.info("📤 Enviando para Gemini para análise...")
+        response_data, _model_used = await _call_gemini_generate_content(
+            request_body,
+            timeout_seconds=45.0,
+        )
+        if "candidates" not in response_data or not response_data["candidates"]:
+            raise ValueError("Resposta vazia do Gemini")
+        
+        content = response_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        
+        # Extrair JSON da resposta
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+        
+        logger.info("✅ Resposta recebida do Gemini")
+        
+        # Parse JSON
+        try:
+            analysis = json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"Erro ao parsear JSON: {content[:200]}")
+            raise HTTPException(
+                status_code=502,
+                detail="IA retornou resposta inválida",
+            )
+        
+        # Validar estrutura
+        items = analysis.get("items", [])
+        summary = analysis.get("resumo", {})
+        structure = analysis.get("structure", {})
+        
+        # Enriquecer dados
+        if not summary.get("valor_total"):
+            summary["valor_total"] = sum(item.get("valor_total", 0) for item in items)
+        if not summary.get("total_items"):
+            summary["total_items"] = len(items)
+        
+        # Salvar análise em cache
+        _OFFLINE_CACHE[payload.upload_id]["ai_analysis"] = {
+            "analyzed_at": datetime.now().isoformat(),
+            "structure": structure,
+            "items": items,
+            "summary": summary
+        }
+        
+        logger.info(f"✅ Análise concluída: {len(items)} items reconhecidos")
+        
+        return {
+            "status": "success",
+            "upload_id": payload.upload_id,
+            "analysis": {
+                "structure": structure,
+                "items": items,
+                "summary": summary,
+                "confianca_geral": summary.get("confianca_analise", 0.8)
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erro na análise com IA: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao analisar com IA: {str(e)}",
         )
 
 # ============== FIRESTORE OPERATIONS ==============
@@ -517,44 +786,48 @@ async def get_curva_abc(upload_id: str):
                 detail=f"❌ Orçamento não encontrado: {upload_id}",
             )
         
-        # Extrair itens das tabelas
-        tables = orcamento.get("tables", [])
-        items = []
+        # Usar items já extraídos pelo parser (se disponíveis)
+        items = orcamento.get("items", [])
         
-        for table in tables:
-            rows = table.get("rows", [])
+        # Se não tem items extraídos, tentar das tabelas (fallback legado)
+        if not items:
+            tables = orcamento.get("tables", [])
+            items = []
             
-            # Pular primeira linha (cabeçalho)
-            for row in rows[1:]:
-                if len(row) < 4:
-                    continue
+            for table in tables:
+                rows = table.get("rows", [])
                 
-                try:
-                    # Tentar extrair: descrição, quantidade, unidade, valor unitário
-                    descricao = str(row[0] or "").strip()
-                    quantidade_str = str(row[1] or "").strip()
-                    unidade = str(row[2] or "").strip()
-                    valor_str = str(row[3] or "").strip()
-                    
-                    if not descricao or descricao.lower() in ["total", "subtotal", ""]:
+                # Pular primeira linha (cabeçalho)
+                for row in rows[1:]:
+                    if len(row) < 4:
                         continue
                     
-                    # Limpar e converter valores numéricos
-                    quantidade = float(quantidade_str.replace(",", "."))
-                    valor_unitario = float(valor_str.replace("R$", "").replace(",", ".").strip())
-                    valor_total = quantidade * valor_unitario
-                    
-                    items.append({
-                        "id": f"item_{len(items) + 1}",
-                        "descricao": descricao,
-                        "quantidade": quantidade,
-                        "unidade": unidade,
-                        "valor_unitario": valor_unitario,
-                        "valor_total": valor_total,
-                        "status": "validado"
-                    })
-                except (ValueError, IndexError, TypeError):
-                    continue
+                    try:
+                        # Tentar extrair: descrição, quantidade, unidade, valor unitário
+                        descricao = str(row[0] or "").strip()
+                        quantidade_str = str(row[1] or "").strip()
+                        unidade = str(row[2] or "").strip()
+                        valor_str = str(row[3] or "").strip()
+                        
+                        if not descricao or descricao.lower() in ["total", "subtotal", ""]:
+                            continue
+                        
+                        # Limpar e converter valores numéricos
+                        quantidade = float(quantidade_str.replace(",", "."))
+                        valor_unitario = float(valor_str.replace("R$", "").replace(",", ".").strip())
+                        valor_total = quantidade * valor_unitario
+                        
+                        items.append({
+                            "id": f"item_{len(items) + 1}",
+                            "descricao": descricao,
+                            "quantidade": quantidade,
+                            "unidade": unidade,
+                            "valor_unitario": valor_unitario,
+                            "valor_total": valor_total,
+                            "status": "validado"
+                        })
+                    except (ValueError, IndexError, TypeError):
+                        continue
         
         if not items:
             return {

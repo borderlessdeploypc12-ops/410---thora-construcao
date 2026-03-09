@@ -6,15 +6,32 @@ import {
 } from "./firebase";
 
 // Detectar URL da API
-// Em desenvolvimento: usar porta do Vite se houver, senão localhost:8001
-// Em produção: usar variável de ambiente ou mesma origem
+// Prioridade:
+// 1) VITE_API_URL (quando definido)
+// 2) Em dev com app servido pelo backend em 8000: mesma origem
+// 3) Em dev com Vite: proxy/local backend
+// 4) Em produção: mesma origem
 const getAPIBase = () => {
+  const isLocalhost = ["localhost", "127.0.0.1"].includes(
+    window.location.hostname,
+  );
+
+  if (isLocalhost) {
+    return window.location.origin;
+  }
+
+  if (import.meta.env.VITE_API_URL) {
+    return import.meta.env.VITE_API_URL;
+  }
+
   if (import.meta.env.DEV) {
-    // Desenvolvimento: usar localhost:8001 (servidor unificado)
-    return "http://localhost:8001";
+    if (window.location.port === "8000") {
+      return window.location.origin;
+    }
+
+    return "http://localhost:8000";
   } else {
-    // Produção: usar variável de ambiente VITE_API_URL ou mesma origem
-    return import.meta.env.VITE_API_URL || window.location.origin;
+    return window.location.origin;
   }
 };
 
@@ -37,9 +54,13 @@ export const uploadPDF = async (file: File) => {
   try {
     const response = await apiClient.post("/api/upload", formData, {
       headers: { "Content-Type": "multipart/form-data" },
+      timeout: 120000,
     });
     return response.data;
   } catch (error: any) {
+    if (error?.code === "ECONNABORTED") {
+      throw new Error("Timeout no upload. Verifique conexão/servidor e tente novamente.");
+    }
     throw new Error(error.response?.data?.detail || "Erro ao enviar arquivo");
   }
 };
@@ -49,11 +70,15 @@ export const extractPDF = async (uploadId: string) => {
   try {
     const response = await apiClient.post("/api/extract", null, {
       params: { upload_id: uploadId },
+      timeout: 600000,
     });
 
     // Dados já foram salvos no backend/Firestore
     return response.data;
   } catch (error: any) {
+    if (error?.code === "ECONNABORTED") {
+      throw new Error("Extração demorou demais. Tente novamente ou use um PDF menor.");
+    }
     throw new Error(error.response?.data?.detail || "Erro ao extrair dados");
   }
 };

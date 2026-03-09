@@ -12,6 +12,13 @@ Write-Host ""
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommandPath
 Set-Location $ScriptDir
 
+# Python da venv do workspace
+$PythonExe = Join-Path $ScriptDir "..\.venv\Scripts\python.exe"
+if (!(Test-Path $PythonExe)) {
+    Write-Host "❌ Python da venv não encontrado em $PythonExe" -ForegroundColor Red
+    exit 1
+}
+
 # Step 1: Verificar se frontend foi buildado
 if (!(Test-Path "frontend\dist")) {
     Write-Host "[1/3] 📦 Building frontend..." -ForegroundColor Yellow
@@ -30,10 +37,10 @@ Write-Host "[2/3] 🔧 Preparando backend..." -ForegroundColor Yellow
 Push-Location backend
 
 # Verificar se FastAPI está instalado
-$fastapi_test = python -c "import fastapi" 2>&1
+$fastapi_test = & $PythonExe -c "import fastapi" 2>&1
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  Instalando dependências..." -ForegroundColor Yellow
-    python -m pip install -q -r requirements.txt
+    & $PythonExe -m pip install -q -r requirements.txt
     Write-Host "  ✅ Dependências instaladas!" -ForegroundColor Green
 } else {
     Write-Host "  ✅ Dependências já estão instaladas" -ForegroundColor Green
@@ -52,5 +59,5 @@ Write-Host "============================================================" -Foreg
 Write-Host ""
 
 Push-Location backend
-python main.py
+& $PythonExe main.py
 Pop-Location

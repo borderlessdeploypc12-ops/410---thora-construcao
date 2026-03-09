@@ -9,6 +9,14 @@ echo ============================================================
 REM Mudar para o diretório do projeto
 cd /d "%~dp0"
 
+REM Python da venv do workspace
+set "PYTHON_EXE=%~dp0..\.venv\Scripts\python.exe"
+if not exist "%PYTHON_EXE%" (
+    echo ❌ Python da venv nao encontrado em %PYTHON_EXE%
+    pause
+    exit /b 1
+)
+
 REM Step 1:Verificar se frontend foi buildado
 if not exist "frontend\dist" (
     echo.
@@ -26,10 +34,10 @@ echo [2/3] Preparando backend...
 cd backend
 
 REM Verificar se requirements.txt foi instalado
-python -c "import fastapi" >nul 2>&1
+"%PYTHON_EXE%" -c "import fastapi" >nul 2>&1
 if errorlevel 1 (
     echo Instalando dependências...
-    python -m pip install -q -r requirements.txt
+    "%PYTHON_EXE%" -m pip install -q -r requirements.txt
 )
 
 REM Step 3: Rodar backend
@@ -41,6 +49,6 @@ echo ✅ Servidor rodando em: http://localhost:8000
 echo ============================================================
 echo.
 
-python main.py
+"%PYTHON_EXE%" main.py
 
 pause
