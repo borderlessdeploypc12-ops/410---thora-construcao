@@ -8,10 +8,12 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_FOLDER = BASE_DIR / "uploads"
 TEMP_FOLDER = BASE_DIR / "temp"
+CACHE_FOLDER = BASE_DIR / "cache"
 
 # Criar pastas se não existirem
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 TEMP_FOLDER.mkdir(exist_ok=True)
+CACHE_FOLDER.mkdir(exist_ok=True)
 
 # Ambiente
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
@@ -43,8 +45,8 @@ API_DESCRIPTION = "API para processar e gerar orçamentos de obras"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
-# Debug: verificar se chave foi carregada
+# Debug seguro: verificar se a chave foi carregada (sem vazar conteúdo)
 if GEMINI_API_KEY:
-    print(f"✅ GEMINI_API_KEY carregada (primeiros 10 chars): {GEMINI_API_KEY[:10]}...")
+    print("✅ GEMINI_API_KEY carregada")
 else:
-    print("⚠️  GEMINI_API_KEY NÃO encontrada no .env")
+    print("⚠️  GEMINI_API_KEY não encontrada no .env")

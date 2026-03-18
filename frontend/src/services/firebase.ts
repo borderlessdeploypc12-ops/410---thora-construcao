@@ -11,6 +11,7 @@ import {
   doc,
 } from "firebase/firestore";
 import { getAnalytics } from "firebase/analytics";
+import { getAuth, signInAnonymously } from "firebase/auth";
 
 // Firebase configuration
 const firebaseConfig = {
@@ -27,6 +28,31 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 const analytics = getAnalytics(app);
+
+// Firebase Auth (protects backend endpoints)
+const auth = getAuth(app);
+let authInitPromise: Promise<string> | null = null;
+
+export const ensureAuthToken = async (): Promise<string> => {
+  if (authInitPromise) return authInitPromise;
+
+  authInitPromise = (async () => {
+    if (auth.currentUser) {
+      return auth.currentUser.getIdToken();
+    }
+
+    // If anonymous auth is enabled in Firebase, this produces an ID token.
+    const result = await signInAnonymously(auth);
+    return result.user.getIdToken();
+  })();
+
+  try {
+    return await authInitPromise;
+  } catch (e) {
+    authInitPromise = null;
+    throw e;
+  }
+};
 
 // ==================== INTERFACES ====================
 
@@ -150,4 +176,4 @@ export const deleteOrcamento = async (documentId: string) => {
   }
 };
 
-export { db, app };
+export { db, app, auth };

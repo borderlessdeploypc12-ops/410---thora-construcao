@@ -1,12 +1,13 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime
 import uuid
+import os
 import logging
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional, Any
 import json
 
 import httpx
@@ -21,11 +22,14 @@ from config import (
     MAX_FILE_SIZE,
     TEMP_FOLDER,
     BASE_DIR,
+    CACHE_FOLDER,
     GEMINI_API_KEY,
     GEMINI_MODEL,
+    ENVIRONMENT,
 )
 from firebase_service import OrcamentoFirestore
 from budget_parser import BudgetParser
+from firebase_admin import auth as firebase_auth
 
 try:
     import pdfplumber
@@ -105,6 +109,108 @@ async def _call_gemini_generate_content(request_body: dict, timeout_seconds: flo
 # Cache em memória para modo offline (dados temporários)
 _OFFLINE_CACHE = {}
 
+
+async def get_current_user_id(request: Request) -> str:
+    """
+    Identifica o usuário via Firebase Auth ID token.
+    Necessário para proteger endpoints sensíveis em produção.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[len("Bearer ") :].strip()
+        try:
+            decoded = firebase_auth.verify_id_token(token)
+            uid = decoded.get("uid")
+            if not uid:
+                raise ValueError("uid ausente no token")
+            return str(uid)
+        except Exception:
+            if ENVIRONMENT == "development":
+                return request.headers.get("X-Dev-User", "dev-user")
+            raise HTTPException(status_code=401, detail="Token inválido")
+
+    # Dev fallback (evita travar desenvolvimento local)
+    if ENVIRONMENT == "development":
+        dev_user = request.headers.get("X-Dev-User", "dev-user")
+        return dev_user
+
+    raise HTTPException(status_code=401, detail="Não autenticado")
+
+
+def _validate_upload_id(upload_id: str) -> str:
+    """
+    Valida e normaliza o upload_id para UUID canônico.
+    Ajuda a evitar path traversal e wildcard glob inseguro.
+    """
+    try:
+        return str(uuid.UUID(str(upload_id)))
+    except Exception:
+        raise HTTPException(status_code=400, detail="upload_id inválido (esperado UUID)")
+
+
+def _cache_path_for_upload_id(upload_id: str) -> Path:
+    upload_id = _validate_upload_id(upload_id)
+    return CACHE_FOLDER / f"{upload_id}.json"
+
+
+def _load_extracted_cache(upload_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Carrega cache persistente em disco para suportar múltiplos workers/instâncias.
+    """
+    try:
+        cache_path = _cache_path_for_upload_id(upload_id)
+        if not cache_path.exists():
+            return None
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(f"⚠️ Falha ao carregar cache offline: {exc}")
+        return None
+
+
+def _save_extracted_cache(upload_id: str, payload: Dict[str, Any]) -> None:
+    """
+    Salva cache persistente em disco para suportar múltiplos workers/instâncias.
+    """
+    upload_id = _validate_upload_id(upload_id)
+    cache_path = CACHE_FOLDER / f"{upload_id}.json"
+    tmp_path = CACHE_FOLDER / f"{upload_id}.json.tmp"
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+    # Atomiza escrita no mesmo filesystem
+    os.replace(str(tmp_path), str(cache_path))
+
+
+def _meta_path_for_upload_id(upload_id: str) -> Path:
+    upload_id = _validate_upload_id(upload_id)
+    return CACHE_FOLDER / f"{upload_id}.meta.json"
+
+
+def _save_upload_meta(upload_id: str, meta: Dict[str, Any]) -> None:
+    upload_id = _validate_upload_id(upload_id)
+    meta_path = _meta_path_for_upload_id(upload_id)
+    tmp_path = CACHE_FOLDER / f"{upload_id}.meta.json.tmp"
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False)
+    os.replace(str(tmp_path), str(meta_path))
+
+
+def _load_upload_meta(upload_id: str) -> Dict[str, Any]:
+    try:
+        meta_path = _meta_path_for_upload_id(upload_id)
+        if not meta_path.exists():
+            return {}
+        with open(meta_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
 # FastAPI app
 app = FastAPI(
     title=API_TITLE,
@@ -163,7 +269,10 @@ class AIStandardizeRequest(BaseModel):
 
 
 @app.post("/api/ai/standardize")
-async def ai_standardize_items(payload: AIStandardizeRequest):
+async def ai_standardize_items(
+    payload: AIStandardizeRequest,
+    user_id: str = Depends(get_current_user_id),
+):
     if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=503,
@@ -247,7 +356,10 @@ async def ai_standardize_items(payload: AIStandardizeRequest):
 
 # ============== UPLOAD PDF ==============
 @app.post("/api/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Upload de arquivo PDF
     
@@ -278,11 +390,22 @@ async def upload_pdf(file: UploadFile = File(...)):
         
         # Gerar ID único
         upload_id = str(uuid.uuid4())
-        file_path = UPLOAD_FOLDER / f"{upload_id}_{file.filename}"
+        # Guarda o PDF com nome controlado (evita path traversal via file.filename)
+        file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
         
         # Salvar arquivo
         with open(file_path, "wb") as buffer:
             buffer.write(contents)
+
+        # Guarda metadados para uso em /api/extract (UX) sem confiar no nome original no filesystem
+        _save_upload_meta(
+            upload_id,
+            {
+                "userId": user_id,
+                "filename": file.filename,
+                "content_type": file.content_type,
+            },
+        )
         
         logger.info(f"✅ PDF salvo: {file_path} ({len(contents) / 1024 / 1024:.2f}MB)")
         
@@ -305,7 +428,10 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 # ============== EXTRACT PDF ==============
 @app.post("/api/extract")
-async def extract_pdf(upload_id: str):
+async def extract_pdf(
+    upload_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Extrai tabelas do PDF usando pdfplumber
     Salva dados no Firestore e deleta arquivo PDF
@@ -329,16 +455,21 @@ async def extract_pdf(upload_id: str):
                 detail="pdfplumber não está instalado",
             )
         
-        # Encontrar arquivo
-        files = list(UPLOAD_FOLDER.glob(f"{upload_id}_*"))
-        if not files:
+        upload_id = _validate_upload_id(upload_id)
+        file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
+        if not file_path.exists():
             raise HTTPException(
                 status_code=404,
                 detail=f"❌ Upload não encontrado: {upload_id}",
             )
-        
-        file_path = files[0]
-        filename = file_path.name
+
+        meta = _load_upload_meta(upload_id)
+        expected_user = meta.get("userId")
+        if expected_user and str(expected_user) != str(user_id):
+            raise HTTPException(status_code=403, detail="Acesso negado")
+        if not expected_user and ENVIRONMENT != "development":
+            raise HTTPException(status_code=403, detail="Acesso negado")
+        filename = str(meta.get("filename") or file_path.name)
         
         # Extrair tabelas
         tables = []
@@ -426,6 +557,7 @@ async def extract_pdf(upload_id: str):
         # Salvar no Firestore
         try:
             doc_id = OrcamentoFirestore.save_orcamento(
+                user_id=user_id,
                 upload_id=upload_id,
                 filename=filename,
                 tables=tables,
@@ -440,6 +572,7 @@ async def extract_pdf(upload_id: str):
         # Salvar em cache para modo offline
         _OFFLINE_CACHE[upload_id] = {
             "uploadId": upload_id,
+            "userId": user_id,
             "filename": filename,
             "tables": tables,
             "items": items,
@@ -451,11 +584,19 @@ async def extract_pdf(upload_id: str):
             "status": "completed"
         }
         logger.info(f"✅ Dados salvos em cache offline: {upload_id}")
+
+        # Persiste em disco para funcionar com múltiplos workers/instâncias
+        _save_extracted_cache(upload_id, _OFFLINE_CACHE[upload_id])
         
         # Deletar arquivo PDF
         try:
             file_path.unlink()
             logger.info(f"🗑️  PDF deletado: {file_path}")
+
+            meta_path = _meta_path_for_upload_id(upload_id)
+            if meta_path.exists():
+                meta_path.unlink()
+                logger.info(f"🗑️  Metadados deletados: {meta_path}")
         except Exception as e:
             logger.warning(f"⚠️  Erro ao deletar PDF: {str(e)}")
         
@@ -487,7 +628,10 @@ class AnalyzeWithAIRequest(BaseModel):
     focus: str = "budget"  # budget, items, structure, all
 
 @app.post("/api/analyze-with-ai")
-async def analyze_with_ai(payload: AnalyzeWithAIRequest):
+async def analyze_with_ai(
+    payload: AnalyzeWithAIRequest,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Análise inteligente de dados extraídos com IA Gemini
     
@@ -519,13 +663,19 @@ async def analyze_with_ai(payload: AnalyzeWithAIRequest):
                 detail="Recurso de IA indisponível: chave do Gemini não configurada",
             )
         
-        # Buscar dados extraídos
-        upload_data = _OFFLINE_CACHE.get(payload.upload_id)
+        # Buscar dados extraídos (suporta múltiplos workers/instâncias)
+        upload_data = _OFFLINE_CACHE.get(payload.upload_id) or _load_extracted_cache(
+            payload.upload_id
+        )
         if not upload_data:
             raise HTTPException(
                 status_code=404,
                 detail=f"❌ Dados extraídos não encontrados: {payload.upload_id}",
             )
+
+        expected_user = upload_data.get("userId")
+        if expected_user and str(expected_user) != str(user_id):
+            raise HTTPException(status_code=403, detail="Acesso negado")
         
         tables = upload_data.get("tables", [])
         if not tables:
@@ -695,7 +845,7 @@ Regras:
 # ============== FIRESTORE OPERATIONS ==============
 
 @app.get("/api/orcamentos")
-async def list_orcamentos():
+async def list_orcamentos(user_id: str = Depends(get_current_user_id)):
     """
     Listar todos os orçamentos salvos no Firestore
     
@@ -707,7 +857,7 @@ async def list_orcamentos():
         }
     """
     try:
-        orcamentos = OrcamentoFirestore.list_all_orcamentos()
+        orcamentos = OrcamentoFirestore.list_all_orcamentos(user_id)
         return {
             "status": "success",
             "count": len(orcamentos),
@@ -721,7 +871,10 @@ async def list_orcamentos():
         )
 
 @app.get("/api/orcamentos/{upload_id}")
-async def get_orcamento(upload_id: str):
+async def get_orcamento(
+    upload_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Recuperar orçamento específico do Firestore
     
@@ -735,7 +888,9 @@ async def get_orcamento(upload_id: str):
         }
     """
     try:
-        orcamento = OrcamentoFirestore.get_orcamento_by_upload_id(upload_id)
+        orcamento = OrcamentoFirestore.get_orcamento_by_upload_id(
+            upload_id, user_id
+        )
         
         if not orcamento:
             raise HTTPException(
@@ -758,7 +913,10 @@ async def get_orcamento(upload_id: str):
 
 # ============== CURVA ABC ==============
 @app.get("/api/curva-abc/{upload_id}")
-async def get_curva_abc(upload_id: str):
+async def get_curva_abc(
+    upload_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Calcula Curva ABC (análise de Pareto) para itens do orçamento
     
@@ -774,11 +932,19 @@ async def get_curva_abc(upload_id: str):
     """
     try:
         # Buscar orçamento
-        orcamento = OrcamentoFirestore.get_orcamento_by_upload_id(upload_id)
+        orcamento = OrcamentoFirestore.get_orcamento_by_upload_id(
+            upload_id, user_id
+        )
         
         # Se não encontrou no Firestore, tentar buscar do cache offline
         if not orcamento:
-            orcamento = _OFFLINE_CACHE.get(upload_id)
+            orcamento = _OFFLINE_CACHE.get(upload_id) or _load_extracted_cache(
+                upload_id
+            )
+            if orcamento:
+                expected_user = orcamento.get("userId")
+                if expected_user and str(expected_user) != str(user_id):
+                    raise HTTPException(status_code=403, detail="Acesso negado")
         
         if not orcamento:
             raise HTTPException(
@@ -906,7 +1072,10 @@ async def get_curva_abc(upload_id: str):
 
 # ============== EXPORT XLSX ==============
 @app.post("/api/export-xlsx")
-async def export_xlsx(items: List[Dict]):
+async def export_xlsx(
+    items: List[Dict],
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Exporta itens da planilha para arquivo XLSX
     

@@ -3,6 +3,7 @@ import {
   saveOrcamento,
   getOrcamentoByUploadId,
   getAllOrcamentos,
+  ensureAuthToken,
 } from "./firebase";
 
 // Detectar URL da API
@@ -42,6 +43,19 @@ export const apiClient = axios.create({
   headers: {
     "Content-Type": "application/json",
   },
+});
+
+// Attach Firebase ID token to protect backend endpoints.
+apiClient.interceptors.request.use(async (config) => {
+  try {
+    const token = await ensureAuthToken();
+    config.headers = config.headers ?? {};
+    (config.headers as any).Authorization = `Bearer ${token}`;
+  } catch (e) {
+    // Local dev can rely on backend's dev fallback auth.
+    if (!import.meta.env.DEV) throw e;
+  }
+  return config;
 });
 
 // ==================== PDF OPERATIONS ====================
