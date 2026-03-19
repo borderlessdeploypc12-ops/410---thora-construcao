@@ -319,6 +319,7 @@ async def get_current_user_id(request: Request) -> str:
     TODO: Implementar validação real com Firebase
     """
     # Tenta extrair do header Authorization: Bearer <token>
+    anonymous_user_id = request.headers.get("X-Anonymous-User", "").strip()
     auth_header = request.headers.get("Authorization", "").strip()
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
@@ -331,15 +332,15 @@ async def get_current_user_id(request: Request) -> str:
             # return decoded.get("uid", "anonymous")
         except Exception as e:
             logger.warning(f"⚠️ Erro ao validar token: {e}")
+
+    if anonymous_user_id:
+        return anonymous_user_id
     
-    # Fallback: gerar ID anônimo para dev
+    # Fallback: gerar ID anônimo se nenhum identificador foi enviado
     if ENVIRONMENT == "development":
         return "dev-user-" + str(uuid.uuid4())[:8]
     
-    raise HTTPException(
-        status_code=401,
-        detail="❌ Autenticação requerida. Envie um Firebase ID token no header Authorization: Bearer <token>"
-    )
+    return "anon-server-" + str(uuid.uuid4())[:8]
 
 
 def _meta_path_for_upload_id(upload_id: str) -> Path:

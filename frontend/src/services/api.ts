@@ -49,6 +49,21 @@ const API_BASE = getAPIBase();
 
 console.info(`🌐 API Base: ${API_BASE}`);
 
+const ANONYMOUS_USER_STORAGE_KEY = "thora_anonymous_user_id";
+
+const getAnonymousUserId = () => {
+  const existingUserId = window.localStorage.getItem(ANONYMOUS_USER_STORAGE_KEY);
+  if (existingUserId) {
+    return existingUserId;
+  }
+
+  const generatedUserId =
+    "anon-" +
+    (window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+  window.localStorage.setItem(ANONYMOUS_USER_STORAGE_KEY, generatedUserId);
+  return generatedUserId;
+};
+
 export const apiClient = axios.create({
   baseURL: API_BASE,
   headers: {
@@ -58,14 +73,16 @@ export const apiClient = axios.create({
 
 // Attach Firebase ID token to protect backend endpoints.
 apiClient.interceptors.request.use(async (config) => {
+  config.headers = config.headers ?? {};
+  (config.headers as any)["X-Anonymous-User"] = getAnonymousUserId();
+
   try {
     const token = await ensureAuthToken();
-    config.headers = config.headers ?? {};
     (config.headers as any).Authorization = `Bearer ${token}`;
-  } catch (e) {
-    // Local dev can rely on backend's dev fallback auth.
-    if (!import.meta.env.DEV) throw e;
+  } catch (error) {
+    console.warn("Falha ao obter token Firebase; usando fallback anônimo.", error);
   }
+
   return config;
 });
 

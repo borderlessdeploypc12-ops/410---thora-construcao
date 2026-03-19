@@ -109,7 +109,7 @@ class OrcamentoFirestore:
             raise
     
     @staticmethod
-    def get_orcamento_by_upload_id(upload_id: str, user_id: str) -> Dict[str, Any]:
+    def get_orcamento_by_upload_id(upload_id: str, user_id: str = None) -> Dict[str, Any]:
         """
         Get orçamento by upload ID
         
@@ -123,12 +123,10 @@ class OrcamentoFirestore:
             return None
         
         try:
-            docs = (
-                db.collection("orcamentos")
-                .where("uploadId", "==", upload_id)
-                .where("userId", "==", user_id)
-                .stream()
-            )
+            query_ref = db.collection("orcamentos").where("uploadId", "==", upload_id)
+            if user_id:
+                query_ref = query_ref.where("userId", "==", user_id)
+            docs = query_ref.stream()
             
             for doc in docs:
                 return {
@@ -143,7 +141,7 @@ class OrcamentoFirestore:
             return None
     
     @staticmethod
-    def list_all_orcamentos(user_id: str) -> List[Dict[str, Any]]:
+    def list_all_orcamentos(user_id: str = None) -> List[Dict[str, Any]]:
         """
         List all orçamentos
         
@@ -154,7 +152,10 @@ class OrcamentoFirestore:
             return []
         
         try:
-            docs = db.collection("orcamentos").where("userId", "==", user_id).stream()
+            query_ref = db.collection("orcamentos")
+            if user_id:
+                query_ref = query_ref.where("userId", "==", user_id)
+            docs = query_ref.stream()
             return [
                 {
                     "id": doc.id,
