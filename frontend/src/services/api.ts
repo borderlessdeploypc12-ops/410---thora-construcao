@@ -20,9 +20,10 @@ const getAPIBase = () => {
   const isVercelHost =
     window.location.hostname.endsWith(".vercel.app") ||
     window.location.hostname === "thora-construcao.vercel.app";
+  const isRenderHost = window.location.hostname.endsWith(".onrender.com");
 
-  // No deploy fullstack do Vercel, API e frontend ficam no mesmo domínio.
-  if (!import.meta.env.DEV && isVercelHost) {
+  // Em deploy fullstack, API e frontend ficam no mesmo domínio.
+  if (!import.meta.env.DEV && (isVercelHost || isRenderHost)) {
     return window.location.origin;
   }
 
