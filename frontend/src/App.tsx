@@ -6,25 +6,34 @@ import CurvaABC from "./pages/CurvaABC";
 import Reports from "./pages/Reports";
 import Analytics from "./pages/Analytics";
 import AnaliseDetalhada from "./pages/AnaliseDetalhada";
-import SidebarLayout from "./components/SidebarLayout";
+import Login from "./pages/Login";
+import Cadastro from "./pages/Cadastro";
+import { ProtectedApp } from "./features/auth/ProtectedApp";
 
 const App = () => {
   return (
-    <SidebarLayout>
-      <Routes>
-        {/* Rota principal */}
+    <Routes>
+      {/* Público */}
+      <Route path="/login" element={<Login />} />
+      <Route path="/cadastro" element={<Cadastro />} />
+
+      {/* App protegido */}
+      <Route element={<ProtectedApp />}>
         <Route path="/" element={<Dashboard />} />
         <Route path="/orcamento" element={<NovoOrcamento />} />
         <Route path="/validacao" element={<ValidacaoOrcamento />} />
         <Route path="/curva-abc/:uploadId" element={<CurvaABC />} />
-        <Route path="/analise-detalhada/:uploadId" element={<AnaliseDetalhada />} />
+        <Route
+          path="/analise-detalhada/:uploadId"
+          element={<AnaliseDetalhada />}
+        />
         <Route path="/relatorios" element={<Reports />} />
         <Route path="/analytics" element={<Analytics />} />
+      </Route>
 
-        {/* Fallback */}
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </SidebarLayout>
+      {/* Fallback */}
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   );
 };
 

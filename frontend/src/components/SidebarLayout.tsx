@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   Home,
   FileText,
@@ -10,6 +10,7 @@ import {
   X,
   LogOut,
 } from "lucide-react";
+import { signOutCurrentUser } from "../features/auth/authService";
 
 interface SidebarLayoutProps {
   children: React.ReactNode;
@@ -17,6 +18,7 @@ interface SidebarLayoutProps {
 
 const SidebarLayout: React.FC<SidebarLayoutProps> = ({ children }) => {
   const location = useLocation();
+  const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
   const isActive = (path: string) => {
@@ -38,7 +40,7 @@ const SidebarLayout: React.FC<SidebarLayoutProps> = ({ children }) => {
       <aside
         className={`${
           sidebarOpen ? "w-64" : "w-20"
-        } bg-gradient-to-b from-slate-900 to-slate-800 text-white shadow-lg transition-all duration-300 flex flex-col`}
+        } bg-linear-to-b from-slate-900 to-slate-800 text-white shadow-lg transition-all duration-300 flex flex-col`}
       >
         {/* Logo */}
         <div
@@ -82,7 +84,7 @@ const SidebarLayout: React.FC<SidebarLayoutProps> = ({ children }) => {
                 }`}
                 title={!sidebarOpen ? item.label : ""}
               >
-                <Icon className="w-5 h-5 flex-shrink-0" />
+                <Icon className="w-5 h-5 shrink-0" />
                 {sidebarOpen && <span className="text-sm">{item.label}</span>}
               </Link>
             );
@@ -92,12 +94,17 @@ const SidebarLayout: React.FC<SidebarLayoutProps> = ({ children }) => {
         {/* User Section */}
         <div className="px-3 py-4 border-t border-slate-700">
           <button
+            type="button"
+            onClick={async () => {
+              await signOutCurrentUser();
+              navigate("/login", { replace: true });
+            }}
             className={`flex items-center gap-3 w-full px-4 py-3 rounded-lg text-slate-300 hover:bg-slate-700 hover:text-white transition ${
               !sidebarOpen && "justify-center"
             }`}
             title={!sidebarOpen ? "Sair" : ""}
           >
-            <LogOut className="w-5 h-5 flex-shrink-0" />
+            <LogOut className="w-5 h-5 shrink-0" />
             {sidebarOpen && <span className="text-sm">Sair</span>}
           </button>
         </div>

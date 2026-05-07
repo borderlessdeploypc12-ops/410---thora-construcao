@@ -11,51 +11,30 @@ import {
   doc,
 } from "firebase/firestore";
 import { getAnalytics } from "firebase/analytics";
-import { getAuth, signInAnonymously } from "firebase/auth";
+import { getAuth } from "firebase/auth";
 
 // Firebase configuration
 const firebaseConfig = {
-  apiKey: "AIzaSyAefYNfP4i7lFX7XuZ_pD_4Bpr0RbOTx6c",
-  authDomain: "thora-cf789.firebaseapp.com",
-  projectId: "thora-cf789",
-  storageBucket: "thora-cf789.firebasestorage.app",
-  messagingSenderId: "365630687753",
-  appId: "1:365630687753:web:7e7e665e6755e2b5acc6d8",
-  measurementId: "G-CPHGFSB3V6",
+  apiKey: "AIzaSyDgjwin-zXFzl-J-E7dlxvjmEGe6C_xhMU",
+  authDomain: "borderless-5a4c8.firebaseapp.com",
+  projectId: "borderless-5a4c8",
+  storageBucket: "borderless-5a4c8.firebasestorage.app",
+  messagingSenderId: "333573409559",
+  appId: "1:333573409559:web:34295766534d7e6b8d4552",
 };
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
-const analytics = getAnalytics(app);
+const analytics =
+  "measurementId" in firebaseConfig ? getAnalytics(app) : undefined;
 
 // Firebase Auth (protects backend endpoints)
 const auth = getAuth(app);
-let authInitPromise: Promise<string> | null = null;
-let firebaseAuthDisabled = false;
 
 export const ensureAuthToken = async (): Promise<string> => {
-  if (firebaseAuthDisabled) return "";
-  if (authInitPromise) return authInitPromise;
-
-  authInitPromise = (async () => {
-    if (auth.currentUser) {
-      return auth.currentUser.getIdToken();
-    }
-
-    // If anonymous auth is enabled in Firebase, this produces an ID token.
-    const result = await signInAnonymously(auth);
-    return result.user.getIdToken();
-  })();
-
-  try {
-    return await authInitPromise;
-  } catch (e) {
-    // Avoid retry storm when anonymous auth is not configured in Firebase project.
-    firebaseAuthDisabled = true;
-    authInitPromise = Promise.resolve("");
-    return "";
-  }
+  if (!auth.currentUser) return "";
+  return auth.currentUser.getIdToken();
 };
 
 // ==================== INTERFACES ====================

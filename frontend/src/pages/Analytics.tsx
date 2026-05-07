@@ -1,4 +1,4 @@
-import React, { useState, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   TrendingUp,
@@ -29,6 +29,9 @@ import {
 } from "recharts";
 import jsPDF from "jspdf";
 import html2canvas from "html2canvas";
+import { useAuth } from "../features/auth/AuthContext";
+import { listOrcamentosByUserId } from "../features/orcamentos/orcamentoRepository";
+import type { Orcamento, OrcamentoItem } from "../features/orcamentos/orcamentoTypes";
 
 interface KPI {
   label: string;
@@ -40,10 +43,13 @@ interface KPI {
 
 const Analytics: React.FC = () => {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [dateRange, setDateRange] = useState("30days");
   const [selectedMetric, setSelectedMetric] = useState("all");
   const [isExporting, setIsExporting] = useState(false);
   const dashboardRef = useRef<HTMLDivElement>(null);
+  const [orcamentos, setOrcamentos] = useState<Orcamento[]>([]);
+  const [loading, setLoading] = useState(true);
 
   const formatCurrencyK = (
     value: number | string | ReadonlyArray<number | string> | undefined,
@@ -55,6 +61,78 @@ const Analytics: React.FC = () => {
     }
     return `R$ ${(num / 1000).toFixed(0)}k`;
   };
+
+  const getItemTotal = (item: OrcamentoItem): number => {
+    const total =
+      typeof item.valor_total === "number"
+        ? item.valor_total
+        : typeof item.totalValue === "number"
+          ? item.totalValue
+          : 0;
+    return Number.isFinite(total) ? total : 0;
+  };
+
+  const getOrcamentoTotal = (orcamento: Orcamento): number => {
+    if (!Array.isArray(orcamento.items)) return 0;
+    return orcamento.items.reduce((sum, item) => sum + getItemTotal(item), 0);
+  };
+
+  useEffect(() => {
+    const run = async () => {
+      if (!user?.uid) return;
+      setLoading(true);
+      try {
+        const data = await listOrcamentosByUserId(user.uid);
+        setOrcamentos(data);
+      } finally {
+        setLoading(false);
+      }
+    };
+    run();
+  }, [user?.uid]);
+
+  const totals = useMemo(() => {
+    const totalBudget = orcamentos.reduce((sum, o) => sum + getOrcamentoTotal(o), 0);
+    const totalItems = orcamentos.reduce((sum, o) => sum + (o.itemsFound ?? 0), 0);
+    return { totalBudget, totalItems };
+  }, [orcamentos]);
+
+  const monthlyDataItems = useMemo(() => {
+    // Agrupar por mês (últimos 6 meses) baseado em uploadedAt e soma do total do orçamento
+    const now = new Date();
+    const months: { key: string; label: string; start: Date; end: Date }[] = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const start = new Date(d.getFullYear(), d.getMonth(), 1);
+      const end = new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999);
+      const label = start.toLocaleDateString("pt-BR", { month: "short" }).replace(".", "");
+      const key = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}`;
+      months.push({ key, label: label.charAt(0).toUpperCase() + label.slice(1), start, end });
+    }
+
+    return months.map((m) => {
+      const value = orcamentos
+        .filter((o) => o.uploadedAt >= m.start && o.uploadedAt <= m.end)
+        .reduce((sum, o) => sum + getOrcamentoTotal(o), 0);
+
+      return { month: m.label, value, planned: value };
+    });
+  }, [orcamentos]);
+
+  const categoryData = useMemo(() => {
+    // Ainda não temos categoria/classificação persistida no Firestore.
+    return [] as { name: string; value: number; percentage: number }[];
+  }, []);
+
+  const topSuppliers = useMemo(() => {
+    // Ainda não temos fornecedor persistido no Firestore.
+    return [] as { name: string; spent: number; percentage: number; items: number }[];
+  }, []);
+
+  const priceVariationData = useMemo(() => {
+    // Ainda não temos histórico de preço (budgeted vs actual).
+    return [] as { item: string; budgeted: number; actual: number; variance: number }[];
+  }, []);
 
   // Função para exportar dashboard
   const handleExportDashboard = async () => {
@@ -158,96 +236,39 @@ const Analytics: React.FC = () => {
     }
   };
 
-  // Dados simulados de gastos mensais
-  const monthlyDataItems = [
-    { month: "Jan", value: 245000, planned: 250000 },
-    { month: "Fev", value: 380000, planned: 380000 },
-    { month: "Mar", value: 520000, planned: 500000 },
-    { month: "Abr", value: 410000, planned: 420000 },
-    { month: "Mai", value: 350000, planned: 370000 },
-    { month: "Jun", value: 280000, planned: 300000 },
-  ];
-
-  // Dados de distribuição por categoria
-  const categoryData = [
-    { name: "Estrutura", value: 890000, percentage: 36 },
-    { name: "Alvenaria", value: 480000, percentage: 20 },
-    { name: "Instalações", value: 420000, percentage: 17 },
-    { name: "Acabamento", value: 380000, percentage: 15 },
-    { name: "Outros", value: 280000, percentage: 12 },
-  ];
-
-  // Dados de fornecedores top
-  const topSuppliers = [
-    {
-      name: "Fornecedor A",
-      spent: 680000,
-      percentage: 28,
-      items: 87,
-    },
-    {
-      name: "Fornecedor B",
-      spent: 520000,
-      percentage: 21,
-      items: 64,
-    },
-    {
-      name: "Fornecedor C",
-      spent: 450000,
-      percentage: 18,
-      items: 52,
-    },
-    {
-      name: "Fornecedor D",
-      spent: 380000,
-      percentage: 15,
-      items: 45,
-    },
-    {
-      name: "Outros",
-      spent: 370000,
-      percentage: 18,
-      items: 152,
-    },
-  ];
-
-  // Dados de variação de preços
-  const priceVariationData = [
-    { item: "Cimento", budgeted: 35.50, actual: 36.20, variance: 1.97 },
-    { item: "Aço", budgeted: 3500, actual: 3480, variance: -0.57 },
-    { item: "Blocos", budgeted: 15, actual: 15.80, variance: 5.33 },
-    { item: "Areia", budgeted: 120, actual: 118, variance: -1.67 },
-    { item: "Telha", budgeted: 850, actual: 870, variance: 2.35 },
-  ];
-
   const COLORS = ["#1F4E78", "#2E7AD4", "#5B9BD5", "#9FC2E8", "#BFDBF7"];
 
   // KPIs
   const kpis: KPI[] = [
     {
       label: "Orçamento Total",
-      value: "R$ 2.450.000",
+      value: loading
+        ? "—"
+        : totals.totalBudget.toLocaleString("pt-BR", {
+            style: "currency",
+            currency: "BRL",
+          }),
       change: 0,
       icon: <DollarSign className="w-6 h-6" />,
       color: "bg-blue-500",
     },
     {
-      label: "Gasto Realizado",
-      value: "R$ 2.280.000",
+      label: "Orçamentos",
+      value: loading ? "—" : String(orcamentos.length),
       change: -7.1,
       icon: <TrendingUp className="w-6 h-6" />,
       color: "bg-green-500",
     },
     {
-      label: "Saldo Disponível",
-      value: "R$ 170.000",
+      label: "Itens (total)",
+      value: loading ? "—" : String(totals.totalItems),
       change: 6.9,
       icon: <BarChart3 className="w-6 h-6" />,
       color: "bg-purple-500",
     },
     {
       label: "Taxa de Utilização",
-      value: "93.1%",
+      value: "—",
       change: 0,
       icon: <PieChart className="w-6 h-6" />,
       color: "bg-orange-500",

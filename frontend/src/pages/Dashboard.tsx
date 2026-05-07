@@ -1,5 +1,8 @@
-import React from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useAuth } from "../features/auth/AuthContext";
+import { listOrcamentosByUserId } from "../features/orcamentos/orcamentoRepository";
+import type { Orcamento } from "../features/orcamentos/orcamentoTypes";
 
 interface ResumoCardProps {
   titulo: string;
@@ -38,7 +41,33 @@ const ResumoCard: React.FC<ResumoCardProps> = ({
 };
 
 const Dashboard: React.FC = () => {
-  const navigate = useNavigate()
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  const [orcamentos, setOrcamentos] = useState<Orcamento[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const run = async () => {
+      if (!user?.uid) return;
+      setLoading(true);
+      try {
+        const data = await listOrcamentosByUserId(user.uid);
+        setOrcamentos(data);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    run();
+  }, [user?.uid]);
+
+  const stats = useMemo(() => {
+    const total = orcamentos.length;
+    const processing = orcamentos.filter((o) => o.status === "processing").length;
+    const completed = orcamentos.filter((o) => o.status === "completed").length;
+    const error = orcamentos.filter((o) => o.status === "error").length;
+    return { total, processing, completed, error };
+  }, [orcamentos]);
 
   return (
     <div className="flex-1 overflow-auto bg-slate-50">
@@ -55,7 +84,7 @@ const Dashboard: React.FC = () => {
           </div>
           <button
             type="button"
-            onClick={()=> navigate("/orcamento")}
+            onClick={() => navigate("/orcamento")}
             className="flex items-center gap-2 rounded-xl bg-slate-900 px-6 py-3 text-white font-medium hover:bg-slate-800 transition cursor-pointer"
           >
             + Novo Orçamento
@@ -66,27 +95,26 @@ const Dashboard: React.FC = () => {
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-12">
           <ResumoCard
             titulo="Total de Orçamentos"
-            valor="5"
+            valor={loading ? "—" : String(stats.total)}
             descricao="Todos os projetos"
             variant="blue"
           />
           <ResumoCard
             titulo="Em Processamento"
-            valor="1"
+            valor={loading ? "—" : String(stats.processing)}
             descricao="Aguardando OCR"
             variant="gray"
           />
           <ResumoCard
             titulo="Aguardando Validação"
-            valor="1"
-            descricao="Precisam de revisão"
+            valor="—"
+            descricao="(em breve)"
             variant="yellow"
           />
           <ResumoCard
             titulo="Finalizados"
-            valor="1"
+            valor={loading ? "—" : String(stats.completed)}
             descricao="Prontos para uso"
-            extra="+12% este mês"
             variant="green"
           />
         </div>
@@ -116,68 +144,60 @@ const Dashboard: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200">
-              <tr className="hover:bg-slate-50">
-                <td className="px-6 py-4">
-                  <p className="font-medium text-slate-900">
-                    Residencial Vila Nova – Bloco A
-                  </p>
-                  <p className="text-xs text-slate-500">
-                    Criado em 14 de jan, 2024
-                  </p>
-                </td>
-                <td className="px-6 py-4">
-                  <span className="rounded-full bg-emerald-100 text-emerald-700 px-3 py-1 text-xs font-medium">
-                    Finalizado
-                  </span>
-                </td>
-                <td className="px-6 py-4 text-right">R$ 2.450.000,00</td>
-                <td className="px-6 py-4 text-right">245</td>
-                <td className="px-6 py-4 text-right text-slate-500">
-                  17/01/2024 às 21:00
-                </td>
-              </tr>
+              {loading ? (
+                <tr>
+                  <td className="px-6 py-6 text-slate-500" colSpan={5}>
+                    Carregando orçamentos…
+                  </td>
+                </tr>
+              ) : orcamentos.length === 0 ? (
+                <tr>
+                  <td className="px-6 py-6 text-slate-500" colSpan={5}>
+                    Nenhum orçamento encontrado. Clique em “Novo Orçamento” para começar.
+                  </td>
+                </tr>
+              ) : (
+                orcamentos.slice(0, 20).map((o) => {
+                  const statusLabel =
+                    o.status === "completed"
+                      ? "Finalizado"
+                      : o.status === "processing"
+                        ? "Em Processamento"
+                        : "Erro";
 
-              <tr className="hover:bg-slate-50">
-                <td className="px-6 py-4">
-                  <p className="font-medium text-slate-900">
-                    Escola Municipal Centro
-                  </p>
-                  <p className="text-xs text-slate-500">
-                    Criado em 19 de jan, 2024
-                  </p>
-                </td>
-                <td className="px-6 py-4">
-                  <span className="rounded-full bg-amber-100 text-amber-700 px-3 py-1 text-xs font-medium">
-                    Aguardando Validação
-                  </span>
-                </td>
-                <td className="px-6 py-4 text-right">R$ 1.850.000,00</td>
-                <td className="px-6 py-4 text-right">189</td>
-                <td className="px-6 py-4 text-right text-slate-500">
-                  19/01/2024 às 21:00
-                </td>
-              </tr>
+                  const statusPill =
+                    o.status === "completed"
+                      ? "bg-emerald-100 text-emerald-700"
+                      : o.status === "processing"
+                        ? "bg-blue-100 text-blue-700"
+                        : "bg-red-100 text-red-700";
 
-              <tr className="hover:bg-slate-50">
-                <td className="px-6 py-4">
-                  <p className="font-medium text-slate-900">
-                    Reforma Comercial – Shopping
-                  </p>
-                  <p className="text-xs text-slate-500">
-                    Criado em 21 de jan, 2024
-                  </p>
-                </td>
-                <td className="px-6 py-4">
-                  <span className="rounded-full bg-blue-100 text-blue-700 px-3 py-1 text-xs font-medium">
-                    Em Processamento
-                  </span>
-                </td>
-                <td className="px-6 py-4 text-right">—</td>
-                <td className="px-6 py-4 text-right">—</td>
-                <td className="px-6 py-4 text-right text-slate-500">
-                  21/01/2024 às 21:00
-                </td>
-              </tr>
+                  const updatedAt = (o.updatedAt ?? o.extractedAt ?? o.uploadedAt).toLocaleString("pt-BR");
+
+                  return (
+                    <tr key={o.id} className="hover:bg-slate-50">
+                      <td className="px-6 py-4">
+                        <p className="font-medium text-slate-900">
+                          {o.filename || o.uploadId}
+                        </p>
+                        <p className="text-xs text-slate-500">
+                          Upload: {o.uploadedAt.toLocaleDateString("pt-BR")}
+                        </p>
+                      </td>
+                      <td className="px-6 py-4">
+                        <span className={`rounded-full px-3 py-1 text-xs font-medium ${statusPill}`}>
+                          {statusLabel}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4 text-right">—</td>
+                      <td className="px-6 py-4 text-right">{o.itemsFound ?? "—"}</td>
+                      <td className="px-6 py-4 text-right text-slate-500">
+                        {updatedAt}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>

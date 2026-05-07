@@ -12,8 +12,11 @@ import {
   ZoomOut,
   Loader2,
   Download,
+  CheckCircle2,
 } from "lucide-react";
 import { exportToXLSX } from "../services/api";
+import { useAuth } from "../features/auth/AuthContext";
+import { upsertOrcamento } from "../features/orcamentos/orcamentoRepository";
 
 // --- CONFIGURAÇÃO OBRIGATÓRIA DO WORKER (PARA VITE) ---
 pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`;
@@ -42,6 +45,7 @@ interface ExtractedTable {
 export default function ValidacaoOrcamento() {
   const navigate = useNavigate();
   const location = useLocation(); // <--- Para pegar o arquivo enviado
+  const { user } = useAuth();
 
   // States da Planilha
   const [items, setItems] = useState<ItemOrcamento[]>([]);
@@ -49,6 +53,7 @@ export default function ValidacaoOrcamento() {
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string>("");
   const [isExporting, setIsExporting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [selectAll, setSelectAll] = useState(false);
 
   // States do PDF Viewer
@@ -329,6 +334,63 @@ export default function ValidacaoOrcamento() {
     }
   };
 
+  const handleFinalizar = async () => {
+    const uploadId = location.state?.uploadId as string | undefined;
+    if (!user?.uid) {
+      alert("Você precisa estar logado para finalizar.");
+      return;
+    }
+    if (!uploadId) {
+      alert("Upload ID não encontrado. Reenvie o PDF para gerar um novo orçamento.");
+      return;
+    }
+    if (items.length === 0) {
+      alert("Adicione pelo menos um item antes de finalizar.");
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      const filename =
+        (location.state?.file as File | undefined)?.name ||
+        (pdfFile?.name ?? `orcamento-${uploadId}.pdf`);
+
+      const extractedData = (location.state?.extractedData as ExtractedTable[] | undefined) || [];
+
+      const normalizedItems = items.map((item) => ({
+        id: String(item.id),
+        description: item.description,
+        unit: item.unit,
+        quantity: item.qty,
+        unitValue: item.unitPrice,
+        totalValue: Number(item.qty || 0) * Number(item.unitPrice || 0),
+        selected: Boolean(item.selected),
+      }));
+
+      await upsertOrcamento(uploadId, {
+        userId: user.uid,
+        uploadId,
+        filename,
+        uploadedAt: new Date(),
+        extractedAt: new Date(),
+        updatedAt: new Date(),
+        items: normalizedItems,
+        itemsFound: normalizedItems.length,
+        tablesFound: extractedData.length,
+        status: "completed",
+        errorMessage: null,
+      });
+
+      alert("Orçamento finalizado e salvo com sucesso!");
+      navigate("/", { replace: true });
+    } catch (err: any) {
+      console.error("Erro ao finalizar orçamento:", err);
+      alert(err?.message || "Erro ao salvar orçamento no Firebase.");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-screen bg-white font-sans overflow-hidden">
       {/* HEADER */}
@@ -360,6 +422,15 @@ export default function ValidacaoOrcamento() {
           >
             <Download className="w-4 h-4" />
             {isExporting ? "Exportando..." : "Exportar"}
+          </button>
+          <button
+            disabled={isLoading || items.length === 0 || isSaving}
+            className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition shadow-sm cursor-pointer"
+            onClick={handleFinalizar}
+            title="Salvar orçamento no Firebase"
+          >
+            <CheckCircle2 className="w-4 h-4" />
+            {isSaving ? "Salvando..." : "Finalizar"}
           </button>
           <button
             disabled={isLoading || selectedItemsCount === 0}

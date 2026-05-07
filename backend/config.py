@@ -89,6 +89,6 @@ ENABLE_MULTI_PROVIDER_CHAIN = os.getenv(
 ).lower() in ("1", "true", "yes", "on")
 
 if GEMINI_API_KEY:
-    print("✅ GEMINI_API_KEY carregada")
+    print("GEMINI_API_KEY carregada")
 else:
-    print("⚠️  GEMINI_API_KEY não encontrada no .env")
+    print("AVISO: GEMINI_API_KEY não encontrada no .env")
