@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { Document, Page, pdfjs } from "react-pdf"; // <--- Imports do PDF
+import pdfWorkerSrc from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import {
   ArrowLeft,
   AlertCircle,
@@ -22,7 +23,8 @@ import ConfirmDialog from "../components/ConfirmDialog";
 import { btnAccent, btnMuted, btnSuccess, iconButton } from "../components/ui/buttonClasses";
 
 // --- CONFIGURAÇÃO OBRIGATÓRIA DO WORKER (PARA VITE) ---
-pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`;
+// `?url` faz o Vite emitir o arquivo estático com URL correta (evita CORS do CDN e 404 por path relativo a esta página).
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
 
 // --- INTERFACES ---
 interface ItemOrcamento {
