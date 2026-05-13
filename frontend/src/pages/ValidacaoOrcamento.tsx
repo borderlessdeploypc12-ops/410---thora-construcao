@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { useNavigate, useLocation } from "react-router-dom";
+import { useNavigate, useLocation, useParams } from "react-router-dom";
 import { Document, Page, pdfjs } from "react-pdf"; // <--- Imports do PDF
 import pdfWorkerSrc from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import {
@@ -50,7 +50,11 @@ interface ExtractedTable {
 export default function ValidacaoOrcamento() {
   const navigate = useNavigate();
   const location = useLocation(); // <--- Para pegar o arquivo enviado
+  const { uploadId: uploadIdFromRoute } = useParams<{ uploadId: string }>();
   const { user } = useAuth();
+
+  const resolvedUploadId =
+    (location.state?.uploadId as string | undefined) ?? uploadIdFromRoute;
 
   // States da Planilha
   const [items, setItems] = useState<ItemOrcamento[]>([]);
@@ -347,7 +351,7 @@ export default function ValidacaoOrcamento() {
   };
 
   const handleFinalizar = async () => {
-    const uploadId = location.state?.uploadId as string | undefined;
+    const uploadId = resolvedUploadId;
     if (!user?.uid) {
       toast.error("Sessão necessária", { description: "Faça login para finalizar." });
       return;
@@ -478,7 +482,7 @@ export default function ValidacaoOrcamento() {
                 return;
               }
               const selectedItems = items.filter((item) => item.selected);
-              const uploadId = location.state?.uploadId || "unknown";
+              const uploadId = resolvedUploadId || "unknown";
               navigate(`/curva-abc/${uploadId}`, {
                 state: {
                   items: selectedItems,

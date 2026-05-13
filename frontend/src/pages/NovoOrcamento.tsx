@@ -1,32 +1,103 @@
-import React, { useState, useCallback } from "react";
+import React, { useState, useCallback, useRef, useEffect } from "react";
 import { useDropzone, DropzoneOptions } from "react-dropzone";
 import {
   UploadCloud,
   FileText,
   X,
-  CheckCircle2,
-  Loader2,
   AlertCircle,
+  Loader2,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { uploadPDF, extractPDF } from "../services/api";
 import { btnPrimary } from "../components/ui/buttonClasses";
+import {
+  TableSelector,
+  type MockTableOption,
+} from "../components/TableSelector";
+
+const mockTables: MockTableOption[] = [
+  {
+    id: "1",
+    name: "Planilha de Quantitativos",
+    page: 2,
+    preview: "1.1 | Escavação Mecânica | m3 | 450,00...",
+  },
+  {
+    id: "2",
+    name: "Orçamento Analítico Estimado",
+    page: 5,
+    preview: "Item | Descrição | Unid | Qtd | Valor...",
+  },
+  {
+    id: "3",
+    name: "Cronograma de Desembolso",
+    page: 15,
+    preview: "Etapa | Mês 1 | Mês 2 | Mês 3...",
+  },
+];
+
+type FlowPhase =
+  | "pick_file"
+  | "uploading"
+  | "analyzing_tables"
+  | "selecting_table"
+  | "processing_ai";
+
+/** Linhas compatíveis com o parser da tela de validação (modo demonstração). */
+function buildMockExtractedData(table: MockTableOption) {
+  const rows = [
+    [
+      "Item",
+      "Código",
+      "Banco",
+      "Descrição",
+      "Unidade",
+      "Quantidade",
+      "Valor unitário",
+      "Valor total",
+    ],
+    [
+      "1",
+      "001",
+      "",
+      `Prévia — ${table.name}`,
+      "un",
+      "2",
+      "150,00",
+      "300,00",
+    ],
+    ["2", "002", "", "Outro serviço (mock)", "m", "10", "25,50", "255,00"],
+  ];
+  return [
+    {
+      page: table.page,
+      table_id: `mock-table-${table.id}`,
+      rows,
+    },
+  ];
+}
 
 export default function NovoOrcamento() {
   const navigate = useNavigate();
   const [file, setFile] = useState<File | null>(null);
-  const [uploadStatus, setUploadStatus] = useState<
-    "idle" | "uploading" | "success" | "error"
-  >("idle");
-  const [uploadStep, setUploadStep] = useState<"upload" | "extract">("upload");
+  const [phase, setPhase] = useState<FlowPhase>("pick_file");
+  const [uploadId, setUploadId] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string>("");
+  const processingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Configuração do Dropzone
+  useEffect(() => {
+    return () => {
+      if (processingTimerRef.current) {
+        clearTimeout(processingTimerRef.current);
+      }
+    };
+  }, []);
+
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles && acceptedFiles.length > 0) {
       setFile(acceptedFiles[0]);
-      setUploadStatus("idle");
+      setPhase("pick_file");
+      setUploadId(null);
       setErrorMessage("");
     }
   }, []);
@@ -40,61 +111,84 @@ export default function NovoOrcamento() {
     multiple: false,
   } as unknown as DropzoneOptions);
 
-  // Remover arquivo
   const removeFile = (e: React.MouseEvent) => {
     e.stopPropagation();
     setFile(null);
-    setUploadStatus("idle");
+    setPhase("pick_file");
+    setUploadId(null);
     setErrorMessage("");
   };
 
-  // Upload real com backend
-  const handleUpload = async () => {
+  const handleAfterUpload = async () => {
     if (!file) return;
-
-    setUploadStatus("uploading");
-    setUploadStep("upload");
     setErrorMessage("");
 
+    const id =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `mock-${Date.now()}`;
+    setUploadId(id);
+
+    setPhase("analyzing_tables");
+    await new Promise((r) => setTimeout(r, 1500));
+
+    setPhase("selecting_table");
+  };
+
+  const handleStartFlow = async () => {
+    if (!file) return;
+    setErrorMessage("");
     try {
-      // Step 1: Upload do arquivo
-      const uploadResponse = await uploadPDF(file);
-      const uploadId = uploadResponse.upload_id;
-
-      setUploadStep("extract");
-      const extractResponse = await extractPDF(uploadId);
-
-      setUploadStatus("success");
-      toast.success("PDF processado", {
-        description: "Abrindo a tela de validação…",
-      });
-      navigate("/validacao", {
-        state: {
-          file,
-          uploadId,
-          extractedData: extractResponse.tables,
-        },
-      });
-    } catch (error: any) {
-      console.error("Erro no upload:", error.message);
-      setUploadStatus("error");
-      const msg = error.message || "Erro ao processar arquivo";
+      setPhase("uploading");
+      await new Promise((r) => setTimeout(r, 1200));
+      await handleAfterUpload();
+    } catch (error: unknown) {
+      const msg =
+        error instanceof Error ? error.message : "Erro ao preparar o fluxo";
       setErrorMessage(msg);
-      toast.error("Falha no processamento", { description: msg });
+      setPhase("pick_file");
+      toast.error("Falha", { description: msg });
     }
   };
 
+  const handleSelectTable = (table: MockTableOption) => {
+    if (!file || !uploadId) return;
+
+    toast.success("Tabela selecionada. Iniciando processamento de IA...");
+
+    setPhase("processing_ai");
+    if (processingTimerRef.current) {
+      clearTimeout(processingTimerRef.current);
+    }
+    processingTimerRef.current = setTimeout(() => {
+      processingTimerRef.current = null;
+      navigate(`/validacao/${uploadId}`, {
+        state: {
+          file,
+          uploadId,
+          selectedTableId: table.id,
+          extractedData: buildMockExtractedData(table),
+        },
+      });
+    }, 2000);
+  };
+
+  const showUploadProgress = phase === "uploading";
+  const showTablePhase =
+    phase === "analyzing_tables" ||
+    phase === "selecting_table" ||
+    phase === "processing_ai";
+
   return (
-    <div className="flex-1 overflow-auto flex flex-col items-center px-6 py-12 bg-slate-50">
+    <div className="flex flex-1 flex-col items-center overflow-auto bg-slate-50 px-6 py-12">
       <h1 className="text-2xl font-semibold text-slate-900">Novo Orçamento</h1>
 
-      <p className="mt-2 text-slate-600">
-        Faça upload do PDF da planilha para começar a extração dos dados
+      <p className="mt-2 max-w-xl text-center text-slate-600">
+        Modo demonstração: após o envio simulado, escolha uma tabela para seguir para a
+        validação (sem chamadas ao backend).
       </p>
 
-      {/* ÁREA DE DROPZONE */}
       {!file ? (
-        // ESTADO 1: Nenhum arquivo selecionado
         <div
           {...getRootProps()}
           className={`mt-8 w-full max-w-2xl cursor-pointer rounded-xl border-2 border-dashed p-10 text-center transition duration-200
@@ -104,18 +198,17 @@ export default function NovoOrcamento() {
                 : "border-blue-200 bg-white hover:border-blue-400 hover:bg-blue-50/30"
             }`}
         >
-          <input {...(getInputProps() as any)} />
+          <input {...(getInputProps() as any)} aria-label="Selecionar arquivo PDF" />
 
           <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-blue-50">
             <UploadCloud
               className={`h-7 w-7 ${isDragActive ? "text-blue-600" : "text-blue-500"}`}
+              aria-hidden="true"
             />
           </div>
 
           <p className="text-lg font-medium text-slate-800">
-            {isDragActive
-              ? "Pode soltar o arquivo agora"
-              : "Arraste e solte seu PDF"}
+            {isDragActive ? "Pode soltar o arquivo agora" : "Arraste e solte seu PDF"}
           </p>
 
           <p className="text-sm text-slate-500">ou clique para selecionar</p>
@@ -125,24 +218,20 @@ export default function NovoOrcamento() {
           </p>
         </div>
       ) : (
-        // ESTADO 2: Arquivo Selecionado (Preview)
-        <div className="mt-8 w-full max-w-2xl">
-          <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm relative overflow-hidden">
+        <div className="mt-8 flex w-full max-w-5xl flex-col items-stretch">
+          <div className="relative w-full max-w-2xl overflow-hidden rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
             <div className="flex items-center gap-4">
-              <div className="bg-red-50 p-3 rounded-lg">
-                <FileText className="w-8 h-8 text-red-500" />
+              <div className="rounded-lg bg-red-50 p-3" aria-hidden="true">
+                <FileText className="h-8 w-8 text-red-500" />
               </div>
-              <div className="flex-1">
-                <p className="font-medium text-slate-900 truncate">
-                  {file.name}
-                </p>
+              <div className="min-w-0 flex-1">
+                <p className="truncate font-medium text-slate-900">{file.name}</p>
                 <p className="text-sm text-slate-500">
                   {(file.size / 1024 / 1024).toFixed(2)} MB
                 </p>
               </div>
 
-              {/* Botão de Remover (só aparece se não estiver enviando ou finalizado) */}
-              {uploadStatus === "idle" && (
+              {(phase === "pick_file" || phase === "selecting_table") && (
                 <button
                   type="button"
                   onClick={removeFile}
@@ -154,61 +243,57 @@ export default function NovoOrcamento() {
               )}
             </div>
 
-            {/* Barra de Progresso e Status */}
-            {uploadStatus !== "idle" && (
-              <div className="mt-4 pt-4 border-t border-slate-100">
-                <div className="flex items-center justify-between mb-2">
-                  <span
-                    className={`text-sm font-medium flex items-center gap-2 
-                    ${uploadStatus === "success" ? "text-emerald-600" : uploadStatus === "error" ? "text-red-600" : "text-blue-600"}`}
-                  >
-                    {uploadStatus === "uploading" ? (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        {uploadStep === "upload"
-                          ? " Enviando arquivo..."
-                          : " Extraindo dados do PDF..."}
-                      </>
-                    ) : uploadStatus === "success" ? (
-                      <>
-                        <CheckCircle2 className="w-4 h-4" /> Upload concluído!
-                      </>
-                    ) : (
-                      <>
-                        <AlertCircle className="w-4 h-4" /> Erro no upload
-                      </>
-                    )}
-                  </span>
+            {showUploadProgress && (
+              <div className="mt-4 border-t border-slate-100 pt-4" role="status" aria-live="polite">
+                <div className="mb-2 flex items-center gap-2 text-sm font-medium text-blue-600">
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                  Enviando arquivo…
                 </div>
-                {uploadStatus === "uploading" && (
-                  <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
-                    <div className="h-full bg-blue-600 animate-pulse w-2/3 rounded-full"></div>
-                  </div>
-                )}
-                {uploadStatus === "error" && errorMessage && (
-                  <div className="mt-2 p-2 bg-red-50 border border-red-200 rounded text-sm text-red-700">
-                    {errorMessage}
-                  </div>
-                )}
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+                  <div className="h-full w-2/3 animate-pulse rounded-full bg-blue-600" />
+                </div>
+              </div>
+            )}
+
+            {phase === "processing_ai" && (
+              <div className="mt-4 border-t border-slate-100 pt-4" role="status" aria-live="polite">
+                <div className="mb-2 flex items-center gap-2 text-sm font-medium text-blue-600">
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                  Processando com IA…
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+                  <div className="h-full w-full animate-pulse rounded-full bg-blue-600" />
+                </div>
+              </div>
+            )}
+
+            {errorMessage && (
+              <div className="mt-3 flex gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>{errorMessage}</span>
               </div>
             )}
           </div>
 
-          {/* Botão de Ação */}
-          <button
-            type="button"
-            onClick={handleUpload}
-            disabled={uploadStatus !== "idle"}
-            className={`${btnPrimary} mt-6 w-full py-3 ${
-              uploadStatus === "success"
-                ? "!bg-emerald-600 hover:!bg-emerald-700"
-                : ""
-            } disabled:cursor-not-allowed`}
-          >
-            {uploadStatus === "idle" && "Enviar e processar"}
-            {uploadStatus === "uploading" && "Enviando…"}
-            {uploadStatus === "success" && "Continuar"}
-          </button>
+          {phase === "pick_file" && (
+            <button
+              type="button"
+              onClick={() => void handleStartFlow()}
+              className={`${btnPrimary} mt-6 w-full max-w-2xl self-center py-3`}
+              aria-label="Continuar: simular envio e escolher tabela"
+            >
+              Continuar
+            </button>
+          )}
+
+          {showTablePhase && (
+            <TableSelector
+              tables={mockTables}
+              loading={phase === "analyzing_tables" || phase === "uploading"}
+              disabled={phase === "processing_ai"}
+              onSelect={handleSelectTable}
+            />
+          )}
         </div>
       )}
     </div>

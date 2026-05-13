@@ -1,0 +1,120 @@
+import React from "react";
+import { Table2 } from "lucide-react";
+import { btnPrimary } from "./ui/buttonClasses";
+
+export interface MockTableOption {
+  id: string;
+  name: string;
+  page: number;
+  preview: string;
+}
+
+interface TableSelectorProps {
+  tables: MockTableOption[];
+  loading: boolean;
+  disabled?: boolean;
+  onSelect: (table: MockTableOption) => void;
+}
+
+function TableCardSkeleton() {
+  return (
+    <div
+      className="animate-pulse rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"
+      aria-hidden="true"
+    >
+      <div className="mb-4 flex items-center gap-3">
+        <div className="h-12 w-12 shrink-0 rounded-lg bg-slate-200" />
+        <div className="flex-1 space-y-2">
+          <div className="h-4 w-[85%] rounded bg-slate-200" />
+          <div className="h-3 w-20 rounded bg-slate-100" />
+        </div>
+      </div>
+      <div className="space-y-2">
+        <div className="h-3 w-full rounded bg-slate-100" />
+        <div className="h-3 w-[90%] rounded bg-slate-100" />
+        <div className="h-3 w-[70%] rounded bg-slate-100" />
+      </div>
+      <div className="mt-5 h-10 w-full rounded-lg bg-slate-200" />
+    </div>
+  );
+}
+
+export const TableSelector: React.FC<TableSelectorProps> = ({
+  tables,
+  loading,
+  disabled = false,
+  onSelect,
+}) => {
+  if (loading) {
+    return (
+      <div
+        className="mt-8 grid w-full max-w-5xl grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3"
+        role="status"
+        aria-label="Analisando documento em busca de tabelas"
+      >
+        <span className="sr-only">Carregando opções de tabelas…</span>
+        <TableCardSkeleton />
+        <TableCardSkeleton />
+        <TableCardSkeleton />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`mt-8 grid w-full max-w-5xl grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 ${
+        disabled ? "pointer-events-none opacity-60" : ""
+      }`}
+      role="list"
+      aria-label="Tabelas detectadas no documento"
+      aria-busy={disabled}
+    >
+      {tables.map((table) => (
+        <article
+          key={table.id}
+          role="listitem"
+          className="flex flex-col rounded-2xl border border-slate-200 bg-white p-5 shadow-sm transition hover:border-slate-300 hover:shadow-md"
+          aria-labelledby={`table-name-${table.id}`}
+          aria-label={`Card de tabela: ${table.name}, página ${table.page}`}
+        >
+          <div className="mb-4 flex items-start gap-3">
+            <div
+              className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-slate-50"
+              aria-hidden="true"
+            >
+              <Table2 className="h-6 w-6 text-slate-600" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <h3
+                id={`table-name-${table.id}`}
+                className="font-semibold leading-snug text-slate-900"
+              >
+                {table.name}
+              </h3>
+              <p className="mt-1 text-xs font-medium uppercase tracking-wide text-slate-500">
+                Página {table.page}
+              </p>
+            </div>
+          </div>
+
+          <div
+            className="mb-5 flex min-h-[4.5rem] flex-1 rounded-lg border border-slate-100 bg-slate-50/80 p-3 font-mono text-xs leading-relaxed text-slate-600"
+            aria-label={`Prévia do conteúdo: ${table.preview}`}
+          >
+            <p className="line-clamp-4">{table.preview}</p>
+          </div>
+
+          <button
+            type="button"
+            className={`${btnPrimary} mt-auto w-full justify-center`}
+            onClick={() => onSelect(table)}
+            disabled={disabled}
+            aria-label={`Selecionar para orçamento: ${table.name}, página ${table.page}`}
+          >
+            Selecionar para Orçamento
+          </button>
+        </article>
+      ))}
+    </div>
+  );
+};

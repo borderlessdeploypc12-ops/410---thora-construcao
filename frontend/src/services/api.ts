@@ -128,6 +128,55 @@ export const extractPDF = async (uploadId: string) => {
   }
 };
 
+/** Lista tabelas candidatas após upload (curadoria antes da IA). */
+export const detectOrcamentoTables = async (uploadId: string) => {
+  const formData = new FormData();
+  formData.append("upload_id", uploadId);
+  try {
+    const response = await apiClient.post("/api/orcamentos/detect-tables", formData, {
+      headers: { "Content-Type": "multipart/form-data" },
+      timeout: 180000,
+    });
+    return response.data as {
+      status: string;
+      upload_id: string;
+      tables_found: number;
+      options: { id: string; preview_texto: string; num_pagina: number }[];
+      mock_fallback?: boolean;
+    };
+  } catch (error: any) {
+    const detail = error.response?.data?.detail;
+    const msg =
+      typeof detail === "string"
+        ? detail
+        : Array.isArray(detail)
+          ? detail.map((d: { msg?: string }) => d?.msg).join("; ")
+          : "Erro ao detectar tabelas";
+    throw new Error(msg || "Erro ao detectar tabelas");
+  }
+};
+
+/** Processa a tabela escolhida (GPT-4o quando configurado no backend). */
+export const processOrcamentoConfirmed = async (uploadId: string, tableId: string) => {
+  try {
+    const response = await apiClient.post(
+      "/api/orcamentos/process-confirmed",
+      { upload_id: uploadId, table_id: tableId },
+      { timeout: 600000 },
+    );
+    return response.data;
+  } catch (error: any) {
+    const detail = error.response?.data?.detail;
+    const msg =
+      typeof detail === "string"
+        ? detail
+        : Array.isArray(detail)
+          ? detail.map((d: { msg?: string }) => d?.msg).join("; ")
+          : "Erro ao processar tabela";
+    throw new Error(msg || "Erro ao processar tabela");
+  }
+};
+
 // ==================== FIRESTORE OPERATIONS ====================
 
 // Salvar orçamento no Firebase

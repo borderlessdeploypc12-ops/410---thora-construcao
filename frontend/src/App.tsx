@@ -21,6 +21,7 @@ const App = () => {
       <Route element={<ProtectedApp />}>
         <Route path="/" element={<Dashboard />} />
         <Route path="/orcamento" element={<NovoOrcamento />} />
+        <Route path="/validacao/:uploadId" element={<ValidacaoOrcamento />} />
         <Route path="/validacao" element={<ValidacaoOrcamento />} />
         <Route path="/curva-abc/:uploadId" element={<CurvaABC />} />
         <Route

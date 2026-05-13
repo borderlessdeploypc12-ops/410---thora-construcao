@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -7,7 +7,7 @@ import uuid
 import os
 import logging
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any
 import json
 import re
 
@@ -34,6 +34,7 @@ from config import (
     GROQ_MODEL,
     OPENAI_API_KEY,
     OPENAI_MODEL,
+    OPENAI_ORCAMENTO_MODEL,
     OLLAMA_ENABLED,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
@@ -44,6 +45,8 @@ from config import (
 from firebase_service import OrcamentoFirestore
 from budget_parser import BudgetParser
 from firebase_admin import auth as firebase_auth
+from services.openai_service import identify_tables, process_selected_table
+from services.ai_audit_logger import log_ai_exchange
 
 try:
     import pdfplumber
@@ -528,6 +531,122 @@ def _persist_ai_analysis_to_firestore(upload_id: str, ai_payload: Dict) -> None:
         logger.warning("Não foi possível persistir aiAnalysis no Firestore: %s", exc)
 
 
+def _preview_text_for_table_rows(rows: List[List[Any]], max_chars: int = 280) -> str:
+    snippets: List[str] = []
+    for row in rows[:4]:
+        line = " | ".join(str(c)[:60] if c is not None else "" for c in row)
+        if line.strip():
+            snippets.append(line.strip())
+    text = " · ".join(snippets)
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
+
+
+def _extract_tables_from_pdf_path(file_path: Path) -> List[Dict]:
+    """Extrai tabelas de um PDF no disco (mesma lógica usada em /api/extract)."""
+    if not pdfplumber:
+        raise RuntimeError("pdfplumber não está instalado")
+
+    tables: List[Dict] = []
+    with pdfplumber.open(file_path) as pdf:
+        logger.info(f"📄 Processando PDF: {len(pdf.pages)} página(s)")
+
+        for page_num, page in enumerate(pdf.pages):
+            logger.info(f"  Página {page_num + 1}: {page.width}x{page.height}")
+
+            page_tables = page.extract_tables()
+
+            if not page_tables:
+                logger.info("  Tentando extração com settings customizados...")
+                try:
+                    page_tables = page.extract_tables(
+                        {
+                            "vertical_strategy": "text",
+                            "horizontal_strategy": "text",
+                            "snap_tolerance": 5,
+                            "join_tolerance": 5,
+                            "edge_min_length": 3,
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(f"  Erro na extração customizada: {str(e)}")
+                    page_tables = []
+
+            if not page_tables:
+                logger.info("  Tentando extração de texto estruturado...")
+                text = page.extract_text()
+                if text:
+                    lines = [line.strip() for line in text.split("\n") if line.strip()]
+                    if lines:
+                        page_tables = [[[line] for line in lines]]
+                        logger.info(f"  Extraído {len(lines)} linhas de texto")
+
+            if page_tables:
+                for table_idx, table in enumerate(page_tables):
+                    processed_rows = []
+                    for row in table:
+                        processed_row = []
+                        for cell in row:
+                            if cell is None:
+                                processed_row.append("")
+                            elif isinstance(cell, str):
+                                cleaned = cell.strip().replace("\n", " ")
+                                processed_row.append(cleaned)
+                            else:
+                                processed_row.append(str(cell))
+                        processed_rows.append(processed_row)
+
+                    tables.append(
+                        {
+                            "page": page_num + 1,
+                            "table_id": f"page_{page_num}_table_{table_idx}",
+                            "rows": processed_rows,
+                            "original_rows": len(table),
+                            "columns": len(table[0]) if table else 0,
+                        }
+                    )
+                    logger.info(
+                        f"  ✓ Tabela {table_idx + 1}: {len(processed_rows)} linhas x {len(table[0]) if table else 0} colunas"
+                    )
+            else:
+                logger.warning(f"  ⚠️  Nenhuma tabela encontrada na página {page_num + 1}")
+
+    return tables
+
+
+def _find_table_candidate(all_tables: List[Dict], table_id: str) -> Dict | None:
+    for t in all_tables:
+        if t.get("table_id") == table_id:
+            return t
+    if table_id.startswith("tbl-mock-"):
+        try:
+            idx = int(table_id.replace("tbl-mock-", "")) - 1
+        except ValueError:
+            return None
+        if 0 <= idx < len(all_tables):
+            return all_tables[idx]
+    return None
+
+
+def _rows_from_analytic_items(items: List[Dict]) -> List[List[Any]]:
+    header = ["Descrição", "Quantidade", "Unidade", "Valor Unitário", "Valor Total"]
+    out: List[List[Any]] = [header]
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        out.append(
+            [
+                str(it.get("descricao", "")),
+                str(it.get("quantidade", 0)),
+                str(it.get("unidade", "un")),
+                str(it.get("valor_unitario", 0)),
+                str(it.get("valor_total", 0)),
+            ]
+        )
+    return out
+
+
 # FastAPI app
 app = FastAPI(
     title=API_TITLE,
@@ -837,80 +956,18 @@ async def extract_pdf(
         if not expected_user and ENVIRONMENT != "development":
             raise HTTPException(status_code=403, detail="Acesso negado")
         filename = str(meta.get("filename") or file_path.name)
-        
-        # Extrair tabelas
-        tables = []
+
         try:
-            with pdfplumber.open(file_path) as pdf:
-                logger.info(f"📄 Processando PDF: {len(pdf.pages)} página(s)")
-                
-                for page_num, page in enumerate(pdf.pages):
-                    logger.info(f"  Página {page_num + 1}: {page.width}x{page.height}")
-                    
-                    # Estratégia 1: extract_tables() padrão
-                    page_tables = page.extract_tables()
-                    
-                    # Se não encontrou tabelas, tentar com configurações customizadas
-                    if not page_tables:
-                        logger.info(f"  Tentando extração com settings customizados...")
-                        try:
-                            page_tables = page.extract_tables({
-                                "vertical_strategy": "text",
-                                "horizontal_strategy": "text",
-                                "snap_tolerance": 5,
-                                "join_tolerance": 5,
-                                "edge_min_length": 3,
-                            })
-                        except Exception as e:
-                            logger.warning(f"  Erro na extração customizada: {str(e)}")
-                    
-                    # Se ainda não encontrou tabelas, tentar extrair texto estruturado
-                    if not page_tables:
-                        logger.info(f"  Tentando extração de texto estruturado...")
-                        text = page.extract_text()
-                        if text:
-                            lines = [line.strip() for line in text.split('\n') if line.strip()]
-                            if lines:
-                                # Criar uma "tabela" com as linhas de texto
-                                page_tables = [[[line] for line in lines]]
-                                logger.info(f"  Extraído {len(lines)} linhas de texto")
-                    
-                    if page_tables:
-                        for table_idx, table in enumerate(page_tables):
-                            # Processar células mescladas (None) e limpar dados
-                            processed_rows = []
-                            for row in table:
-                                processed_row = []
-                                for cell in row:
-                                    # Converter None para string vazia
-                                    if cell is None:
-                                        processed_row.append("")
-                                    # Limpar espaços extras e quebras de linha
-                                    elif isinstance(cell, str):
-                                        cleaned = cell.strip().replace('\n', ' ')
-                                        processed_row.append(cleaned)
-                                    else:
-                                        processed_row.append(str(cell))
-                                processed_rows.append(processed_row)
-                            
-                            tables.append({
-                                "page": page_num + 1,
-                                "table_id": f"page_{page_num}_table_{table_idx}",
-                                "rows": processed_rows,
-                                "original_rows": len(table),
-                                "columns": len(table[0]) if table else 0
-                            })
-                            logger.info(f"  ✓ Tabela {table_idx + 1}: {len(processed_rows)} linhas x {len(table[0]) if table else 0} colunas")
-                    else:
-                        logger.warning(f"  ⚠️  Nenhuma tabela encontrada na página {page_num + 1}")
-                        
+            tables = _extract_tables_from_pdf_path(file_path)
+        except RuntimeError as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
         except Exception as e:
             logger.error(f"❌ Erro ao extrair tabelas: {str(e)}")
             raise HTTPException(
                 status_code=500,
                 detail=f"Erro ao extrair tabelas: {str(e)}",
-            )
-        
+            ) from e
+
         logger.info(f"✅ {len(tables)} tabela(s) extraída(s) de {file_path}")
         
         # Parsear itens das tabelas usando parser inteligente
@@ -988,6 +1045,268 @@ async def extract_pdf(
             status_code=500,
             detail=str(e),
         )
+
+# ============== DETECÇÃO / PROCESSAMENTO DE TABELA (CURADORIA + OPENAI) ==============
+
+
+class ProcessConfirmedRequest(BaseModel):
+    upload_id: str
+    table_id: str
+
+
+@app.post("/api/orcamentos/detect-tables")
+async def detect_orcamento_tables(
+    upload_id: str = Form(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Lista candidatos a tabela orçamentária para o usuário escolher antes da extração final.
+    Usa pdfplumber para prévias; se não houver tabelas, retorna opções simuladas (mock).
+    """
+    if not pdfplumber:
+        raise HTTPException(status_code=500, detail="pdfplumber não está instalado")
+
+    upload_id = _validate_upload_id(upload_id)
+    file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Upload não encontrado: {upload_id}")
+
+    meta = _load_upload_meta(upload_id)
+    expected_user = meta.get("userId")
+    if expected_user and str(expected_user) != str(user_id):
+        raise HTTPException(status_code=403, detail="Acesso negado")
+    if not expected_user and ENVIRONMENT != "development":
+        raise HTTPException(status_code=403, detail="Acesso negado")
+
+    try:
+        tables = _extract_tables_from_pdf_path(file_path)
+    except Exception as exc:
+        logger.error("detect-tables: falha na extração bruta: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Erro ao analisar PDF: {exc}") from exc
+
+    if tables:
+        options = [
+            {
+                "id": t["table_id"],
+                "preview_texto": _preview_text_for_table_rows(t.get("rows") or []),
+                "num_pagina": t.get("page", 1),
+            }
+            for t in tables
+        ]
+    else:
+        pdf_bytes = file_path.read_bytes()
+        options = identify_tables(pdf_bytes)
+
+    log_ai_exchange(
+        operation="detect_tables",
+        provider="mock+pdfplumber",
+        model="identify_tables_stub",
+        input_payload={"upload_id": upload_id, "tables_found": len(tables)},
+        output_payload={"options": [{"id": o["id"], "num_pagina": o["num_pagina"]} for o in options]},
+    )
+
+    return {
+        "status": "success",
+        "upload_id": upload_id,
+        "tables_found": len(tables),
+        "options": options,
+        "mock_fallback": len(tables) == 0,
+    }
+
+
+def _normalize_analytic_items(raw_items: List[Any]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for idx, it in enumerate(raw_items):
+        if not isinstance(it, dict):
+            continue
+        q = float(it.get("quantidade") or 0)
+        vu = float(it.get("valor_unitario") or 0)
+        vt = float(it.get("valor_total") or 0)
+        if vt <= 0 and q and vu:
+            vt = q * vu
+        normalized.append(
+            {
+                "id": f"item_ai_{idx}",
+                "descricao": str(it.get("descricao", "")).strip(),
+                "quantidade": q,
+                "unidade": str(it.get("unidade", "un") or "un"),
+                "valor_unitario": vu,
+                "valor_total": vt if vt > 0 else q * vu,
+                "status": "validado",
+                "origem": "openai_orcamento_analitico",
+            }
+        )
+    return normalized
+
+
+@app.post("/api/orcamentos/process-confirmed")
+async def process_orcamento_confirmed(
+    payload: ProcessConfirmedRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Processa a tabela escolhida com GPT-4o (quando configurado) e persiste orçamento + ia_metadata.
+    """
+    if not pdfplumber:
+        raise HTTPException(status_code=500, detail="pdfplumber não está instalado")
+
+    upload_id = _validate_upload_id(payload.upload_id)
+    file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Upload não encontrado: {upload_id}")
+
+    meta = _load_upload_meta(upload_id)
+    expected_user = meta.get("userId")
+    if expected_user and str(expected_user) != str(user_id):
+        raise HTTPException(status_code=403, detail="Acesso negado")
+    if not expected_user and ENVIRONMENT != "development":
+        raise HTTPException(status_code=403, detail="Acesso negado")
+
+    filename = str(meta.get("filename") or file_path.name)
+
+    try:
+        all_tables = _extract_tables_from_pdf_path(file_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erro ao ler PDF: {exc}") from exc
+
+    if not all_tables and payload.table_id.startswith("tbl-mock-"):
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhuma tabela tabular foi detectada neste PDF. Envie um PDF com tabela ou use outro arquivo.",
+        )
+
+    selected = _find_table_candidate(all_tables, payload.table_id)
+    if not selected:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tabela não encontrada para o id: {payload.table_id}",
+        )
+
+    rows = selected.get("rows") or []
+    page = int(selected.get("page") or 1)
+    resolved_table_id = str(selected.get("table_id") or payload.table_id)
+    pdf_bytes = file_path.read_bytes()
+
+    provider_used = "parser:fallback"
+    ai_items: List[Dict[str, Any]] = []
+    ai_resumo: Dict[str, Any] = {}
+
+    if OPENAI_API_KEY.strip():
+        try:
+            ai_dict, provider_used = await process_selected_table(
+                pdf_bytes,
+                resolved_table_id,
+                table_rows=rows,
+                table_page=page,
+            )
+            ai_items = _normalize_analytic_items(ai_dict.get("items") or [])
+            ai_resumo = ai_dict.get("resumo") if isinstance(ai_dict.get("resumo"), dict) else {}
+        except Exception as exc:
+            logger.warning("Falha no processamento OpenAI; usando parser local: %s", exc)
+            provider_used = f"parser:fallback_after_error:{type(exc).__name__}"
+            ai_items = []
+            ai_resumo = {}
+
+    parser = BudgetParser()
+    if ai_items:
+        items = ai_items
+        resumo = ai_resumo or {
+            "total_items": len(items),
+            "valor_total": sum(float(i.get("valor_total") or 0) for i in items),
+            "confianca": 0.82,
+            "metodo": "openai_orcamento_analitico",
+        }
+        tables_out = [
+            {
+                "page": page,
+                "table_id": resolved_table_id,
+                "rows": _rows_from_analytic_items(items),
+                "original_rows": len(rows),
+                "columns": len(rows[0]) if rows else 0,
+            }
+        ]
+    else:
+        parsed_data = parser.parse_all_tables([selected])
+        items = parsed_data.get("items", [])
+        resumo = parsed_data.get("resumo", {})
+        tables_out = [selected]
+
+    engine_used = "openai_gpt4o" if ai_items else "budget_parser"
+    ia_metadata: Dict[str, Any] = {
+        "selected_table_id": payload.table_id,
+        "resolved_table_id": resolved_table_id,
+        "model": OPENAI_ORCAMENTO_MODEL if OPENAI_API_KEY.strip() else "BudgetParser",
+        "engine_used": engine_used,
+        "provider": provider_used,
+    }
+
+    try:
+        doc_id = OrcamentoFirestore.save_orcamento(
+            user_id=user_id,
+            upload_id=upload_id,
+            filename=filename,
+            tables=tables_out,
+            items_data={"items": items, "resumo": resumo},
+            ia_metadata=ia_metadata,
+        )
+    except Exception as e:
+        logger.error(f"❌ Erro ao salvar no Firestore: {str(e)}")
+        doc_id = None
+
+    _OFFLINE_CACHE[upload_id] = {
+        "uploadId": upload_id,
+        "userId": user_id,
+        "filename": filename,
+        "tables": tables_out,
+        "items": items,
+        "resumo": resumo,
+        "uploadedAt": datetime.now().isoformat(),
+        "extractedAt": datetime.now().isoformat(),
+        "tablesFound": len(tables_out),
+        "itemsFound": len(items),
+        "status": "completed",
+        "ia_metadata": ia_metadata,
+    }
+    _save_extracted_cache(upload_id, _OFFLINE_CACHE[upload_id])
+
+    try:
+        file_path.unlink()
+        meta_path = _meta_path_for_upload_id(upload_id)
+        if meta_path.exists():
+            meta_path.unlink()
+    except Exception as e:
+        logger.warning("⚠️  Erro ao remover PDF após processamento: %s", e)
+
+    log_ai_exchange(
+        operation="process_confirmed",
+        provider="pipeline",
+        model=str(ia_metadata.get("model", "")),
+        input_payload={
+            "upload_id": upload_id,
+            "table_id": payload.table_id,
+            "resolved_table_id": resolved_table_id,
+        },
+        output_payload={
+            "items_found": len(items),
+            "engine_used": ia_metadata.get("engine_used"),
+            "provider": provider_used,
+        },
+    )
+
+    return {
+        "status": "success",
+        "upload_id": upload_id,
+        "document_id": doc_id,
+        "filename": filename,
+        "tables_found": len(tables_out),
+        "items_found": len(items),
+        "tables": tables_out,
+        "items": items,
+        "resumo": resumo,
+        "ia_metadata": ia_metadata,
+        "message": "Orçamento processado com a tabela selecionada",
+    }
+
 
 # ============== ANALYZE WITH AI ==============
 class AnalyzeWithAIRequest(BaseModel):

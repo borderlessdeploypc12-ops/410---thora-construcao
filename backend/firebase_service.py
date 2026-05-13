@@ -69,6 +69,7 @@ class OrcamentoFirestore:
         filename: str,
         tables: List[Dict[str, Any]],
         items_data: Dict[str, Any] = None,
+        ia_metadata: Dict[str, Any] = None,
     ) -> str:
         """
         Save extracted PDF data to Firestore
@@ -98,6 +99,8 @@ class OrcamentoFirestore:
                 "tablesFound": len(tables),
                 "status": "completed",
             }
+            if ia_metadata:
+                doc_data["ia_metadata"] = ia_metadata
             
             # Add document to collection
             db.collection("orcamentos").add(doc_data)

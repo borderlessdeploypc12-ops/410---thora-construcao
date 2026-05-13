@@ -36,6 +36,8 @@ EXTRA_FRONTEND_URLS = [
 FRONTEND_URLS = [
     "http://localhost:5173",
     "http://localhost:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
     "http://localhost:8001",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:3000",
@@ -64,6 +66,9 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Fluxo Orçamento Analítico (GPT-4o) — chave sempre via .env (nunca no código)
+OPENAI_ORCAMENTO_MODEL = os.getenv("OPENAI_ORCAMENTO_MODEL", "gpt-4o")
+OPENAI_ORCAMENTO_TIMEOUT_SECONDS = float(os.getenv("OPENAI_ORCAMENTO_TIMEOUT", "120"))
 
 # AI local provider (Ollama)
 _default_ollama_enabled = "false" if IS_VERCEL else "true"
