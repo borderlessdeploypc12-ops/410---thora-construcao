@@ -34,9 +34,11 @@ interface ItemOrcamento {
   banco?: string;
   code: string;
   description: string;
+  bdi: number;
   unit: string;
   qty: number;
   unitPrice: number;
+  lineTotal: number;
   selected?: boolean;
   classification?: "A" | "B" | "C";
   accumulated_percentage?: number;
@@ -66,6 +68,8 @@ interface StructuredBudgetItem {
   banco?: string;
   codigo?: string;
   Código?: string;
+  bdi?: number | string;
+  BDI?: number | string;
   descricao?: string;
   Descrição?: string;
   unidade?: string;
@@ -92,26 +96,71 @@ const toNumber = (value: unknown): number => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
+const toBdiPercent = (value: unknown): number => {
+  if (typeof value === "number") return value;
+  if (typeof value !== "string") return 0;
+  const compact = value.replace("%", "").replace(/\s/g, "");
+  return toNumber(compact);
+};
+
+const applyLineSanity = (
+  qty: number,
+  unitPrice: number,
+  lineTotal: number,
+): { qty: number; unitPrice: number; lineTotal: number } => {
+  if (qty <= 0) {
+    return { qty, unitPrice, lineTotal };
+  }
+  if (unitPrice <= 0 && lineTotal > 0) {
+    return { qty, unitPrice: lineTotal / qty, lineTotal };
+  }
+  const expected = qty * unitPrice;
+  if (lineTotal <= 0) {
+    return { qty, unitPrice, lineTotal: expected };
+  }
+  const relErr = Math.abs(expected - lineTotal) / Math.max(Math.abs(expected), Math.abs(lineTotal), 1);
+  if (relErr > 0.02 && (expected > lineTotal * 2 || expected < lineTotal * 0.5)) {
+    return { qty, unitPrice: lineTotal / qty, lineTotal };
+  }
+  return { qty, unitPrice, lineTotal };
+};
+
 const mapStructuredItemsToValidation = (
   items: StructuredBudgetItem[],
 ): ItemOrcamento[] => {
-  return items.map((item, index) => {
-    const quantity = toNumber(item.quantidade ?? item.Quantidade);
-    const unitPrice = toNumber(item.valor_unitario ?? item["Valor Unitário"]);
+  const mapped: ItemOrcamento[] = [];
+  let id = 0;
 
-    return {
-      id: index + 1,
+  for (const item of items) {
+    const tipo = String(item.tipo ?? "item").toLowerCase();
+    const description = String(item.descricao ?? item.Descrição ?? "").trim();
+    const code = String(item.codigo ?? item.Código ?? "").trim();
+    if (tipo === "grupo" || description.toLowerCase().includes("total do grupo")) {
+      continue;
+    }
+
+    let qty = toNumber(item.quantidade ?? item.Quantidade);
+    let unitPrice = toNumber(item.valor_unitario ?? item["Valor Unitário"]);
+    let lineTotal = toNumber(item.valor_total ?? item.Total);
+    ({ qty, unitPrice, lineTotal } = applyLineSanity(qty, unitPrice, lineTotal));
+
+    mapped.push({
+      id: ++id,
       item: String(item.item ?? ""),
-      tipo: String(item.tipo ?? ""),
+      tipo: String(item.tipo ?? "item"),
       banco: String(item.banco ?? ""),
-      code: String(item.codigo ?? item.Código ?? item.item ?? index + 1).padStart(3, "0"),
-      description: String(item.descricao ?? item.Descrição ?? "").trim(),
+      code: code || String(id).padStart(3, "0"),
+      description,
+      bdi: toBdiPercent(item.bdi ?? item.BDI),
       unit: String(item.unidade ?? item.Unidade ?? "un").trim() || "un",
-      qty: quantity,
+      qty,
       unitPrice,
+      lineTotal,
       selected: false,
-    };
-  });
+    });
+  }
+
+  return mapped;
 };
 
 export default function ValidacaoOrcamento() {
@@ -135,25 +184,33 @@ export default function ValidacaoOrcamento() {
 
   // --- LÓGICA DA CURVA ABC ---
   const classifiedItems = useMemo(() => {
-    // Filtramos apenas os itens (ignorando grupos) para o cálculo da Curva ABC
-    const itemsToClassify = items.filter(item => item.tipo !== "grupo");
+    // Filtramos apenas linhas de serviço (ignorando grupos e totais)
+    const itemsToClassify = items.filter(
+      (item) =>
+        item.tipo !== "grupo" &&
+        !item.description.toLowerCase().includes("total do grupo"),
+    );
     
     // Ordenamos por valor total decrescente
     const sortedItems = [...itemsToClassify].sort((a, b) => {
-      const totalA = a.qty * a.unitPrice;
-      const totalB = b.qty * b.unitPrice;
+      const totalA = a.lineTotal > 0 ? a.lineTotal : a.qty * a.unitPrice;
+      const totalB = b.lineTotal > 0 ? b.lineTotal : b.qty * b.unitPrice;
       const diff = totalB - totalA;
       if (diff !== 0) return diff;
       return String(a.id).localeCompare(String(b.id), "pt-BR");
     });
 
-    const totalValue = sortedItems.reduce((acc, item) => acc + (item.qty * item.unitPrice), 0);
+    const totalValue = sortedItems.reduce(
+      (acc, item) =>
+        acc + (item.lineTotal > 0 ? item.lineTotal : item.qty * item.unitPrice),
+      0,
+    );
 
     let accumulatedValue = 0;
     const classifiedMap = new Map<number, { classification: "A" | "B" | "C", accumulated_percentage: number }>();
 
     sortedItems.forEach((item) => {
-      const itemTotal = item.qty * item.unitPrice;
+      const itemTotal = item.lineTotal > 0 ? item.lineTotal : item.qty * item.unitPrice;
       const prevPercentage = totalValue > 0 ? (accumulatedValue / totalValue) * 100 : 0;
       accumulatedValue += itemTotal;
       const currentPercentage = totalValue > 0 ? (accumulatedValue / totalValue) * 100 : 0;
@@ -316,6 +373,7 @@ export default function ValidacaoOrcamento() {
 
     tables.forEach((table) => {
       let descCol = -1,
+        bdiCol = -1,
         unCol = -1,
         qtdCol = -1,
         vuCol = -1;
@@ -337,6 +395,14 @@ export default function ValidacaoOrcamento() {
               descCol = colIdx;
               if (idx === 0)
                 console.log(`✓ Coluna Descrição encontrada: índice ${colIdx}`);
+            } else if (
+              cellText === "bdi" ||
+              cellText.includes("bdi") ||
+              cellText.includes("b.d.i")
+            ) {
+              bdiCol = colIdx;
+              if (idx === 0)
+                console.log(`✓ Coluna BDI encontrada: índice ${colIdx}`);
             } else if (
               cellText.includes("unidade") ||
               cellText.includes("un.") ||
@@ -375,12 +441,14 @@ export default function ValidacaoOrcamento() {
         // PRÓXIMAS LINHAS: Extrair dados usando os índices identificados
         if (row && row.length >= 1) {
           // Se os índices foram encontrados, usa-os; senão tenta ordem padrão
-          const colDesc = descCol >= 0 ? descCol : 3; // Padrão: coluna 3 (depois de Item, Código, Banco)
+          const colDesc = descCol >= 0 ? descCol : 3;
+          const colBdi = bdiCol >= 0 ? bdiCol : -1;
           const colUn = unCol >= 0 ? unCol : 4;
           const colQtd = qtdCol >= 0 ? qtdCol : 5;
           const colVu = vuCol >= 0 ? vuCol : 6;
 
           const description = String(row[colDesc] || "").trim();
+          const bdi = colBdi >= 0 ? toBdiPercent(row[colBdi]) : 0;
           const unit = String(row[colUn] || "un").trim();
           const qty = parseNumber(row[colQtd]);
           const unitPrice = parseNumber(row[colVu]);
@@ -389,13 +457,16 @@ export default function ValidacaoOrcamento() {
           const isNumeric =
             /^\d+(\.\d+)?$/.test(description) || description === "";
           if (description && !isNumeric) {
+            const sane = applyLineSanity(qty, unitPrice, qty * unitPrice);
             items.push({
               id: id++,
               code: `${id.toString().padStart(3, "0")}`,
               description,
+              bdi,
               unit,
-              qty,
-              unitPrice,
+              qty: sane.qty,
+              unitPrice: sane.unitPrice,
+              lineTotal: sane.lineTotal,
             });
           }
         }
@@ -408,7 +479,8 @@ export default function ValidacaoOrcamento() {
   // Recalcula total
   useEffect(() => {
     const total = items.reduce(
-      (acc, item) => acc + item.qty * item.unitPrice,
+      (acc, item) =>
+        acc + (item.lineTotal > 0 ? item.lineTotal : item.qty * item.unitPrice),
       0,
     );
     setTotalGeral(total);
@@ -422,8 +494,13 @@ export default function ValidacaoOrcamento() {
   ) => {
     setItems((prevItems) =>
       prevItems.map((item) => {
-        if (item.id === id) return { ...item, [field]: value };
-        return item;
+        if (item.id !== id) return item;
+        const updated = { ...item, [field]: value } as ItemOrcamento;
+        if (field === "qty" || field === "unitPrice") {
+          updated.lineTotal =
+            Number(updated.qty || 0) * Number(updated.unitPrice || 0);
+        }
+        return updated;
       }),
     );
   };
@@ -440,9 +517,11 @@ export default function ValidacaoOrcamento() {
       id: Math.max(...items.map((i) => i.id), 0) + 1,
       code: `${(items.length + 1).toString().padStart(3, "0")}`,
       description: "",
+      bdi: 0,
       unit: "un",
       qty: 0,
       unitPrice: 0,
+      lineTotal: 0,
       selected: false,
     };
     setItems((prev) => [...prev, newItem]);
@@ -532,10 +611,14 @@ export default function ValidacaoOrcamento() {
         banco: item.banco,
         code: item.code,
         description: item.description,
+        bdi: item.bdi,
         unit: item.unit,
         quantity: item.qty,
         unitValue: item.unitPrice,
-        totalValue: Number(item.qty || 0) * Number(item.unitPrice || 0),
+        totalValue:
+          item.lineTotal > 0
+            ? item.lineTotal
+            : Number(item.qty || 0) * Number(item.unitPrice || 0),
         selected: Boolean(item.selected),
         classification: item.classification,
         accumulated_percentage: item.accumulated_percentage,
@@ -884,6 +967,9 @@ export default function ValidacaoOrcamento() {
                       <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">
                         Descrição
                       </th>
+                      <th className="px-3 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right w-20">
+                        BDI (%)
+                      </th>
                       <th className="px-2 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-center w-14">
                         Un.
                       </th>
@@ -1043,6 +1129,33 @@ export default function ValidacaoOrcamento() {
                             }`}
                           />
                         </td>
+                        <td className="px-3 py-3">
+                          <input
+                            type="number"
+                            step="0.01"
+                            min={0}
+                            inputMode="decimal"
+                            value={item.bdi}
+                            onChange={(e) =>
+                              handleChange(
+                                item.id,
+                                "bdi",
+                                parseFloat(e.target.value) || 0,
+                              )
+                            }
+                            className={`w-full text-right bg-transparent text-sm font-medium focus:outline-none border-b border-transparent focus:border-blue-500 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none ${
+                              item.classification === "A"
+                                ? "text-red-900"
+                                : item.classification === "B"
+                                  ? "text-yellow-900"
+                                  : item.classification === "C"
+                                    ? "text-emerald-900"
+                                    : "text-slate-700"
+                            }`}
+                            placeholder="0,00"
+                            aria-label={`BDI percentual do item ${item.code}`}
+                          />
+                        </td>
                         <td className="px-2 py-3 text-center">
                           <input
                             type="text"
@@ -1138,7 +1251,11 @@ export default function ValidacaoOrcamento() {
                                   ? "text-emerald-900"
                                   : "text-slate-800"
                           }`}>
-                            {formatMoney(item.qty * item.unitPrice)}
+                            {formatMoney(
+                              item.lineTotal > 0
+                                ? item.lineTotal
+                                : item.qty * item.unitPrice,
+                            )}
                           </span>
                         </td>
                         <td className="px-2 py-3 text-center">

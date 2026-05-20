@@ -58,13 +58,16 @@ DETECTION_USER_PROMPT_TEMPLATE = {
 EXTRACTION_SYSTEM_PROMPT = (
     "Você é um Engenheiro de Custos especialista em análise de dados. Sua única missão é extrair os itens da planilha de ORÇAMENTO DETALHADO de arquivos PDF de licitações e estruturá-los em um JSON estrito.\n\n"
     "REGRAS DE EXTRAÇÃO E MAPEAMENTO ESPACIAL (MUITO IMPORTANTE):\n\n"
-    "1. IDENTIFICAÇÃO DE COLUNAS POR CABEÇALHO: Localize horizontalmente onde começam e terminam as colunas 'UNID', 'QUANT', 'PREÇO UNITÁRIO' e 'PREÇO TOTAL'.\n"
-    "2. EXTRAÇÃO BASEADA EM LINHA: Para cada linha, garanta que o valor extraído pertence estritamente ao eixo vertical daquela coluna. Se uma célula estiver vazia, retorne 0.0. NUNCA puxe o valor da coluna vizinha para preencher um buraco.\n"
-    "3. RIGOR COM NÚMEROS E UNIDADES: A coluna 'Unidade' deve conter apenas siglas (M2, M3, UN, M, CHP, CHI, etc). Se a quantidade ou preço contiver letras (ex: '422,33 CHP'), separe o número para a coluna correta e a sigla para a coluna de unidade.\n"
-    "4. LIMPEZA MATEMÁTICA: Remova qualquer símbolo monetário ('R$') e converta os números do padrão brasileiro para o formato float universal (ex: de '1.234,56' para '1234.56'). Retorne APENAS NÚMEROS nos campos de quantidade e valores.\n"
-    "5. FÓRMULA DE CONSISTÊNCIA (SANITY CHECK): Verifique se Quantidade * Valor Unitário = Valor Total (com margem de erro de arredondamento). Se o cálculo não bater, RE-ESCANEIE a linha, pois houve erro de leitura ou deslocamento de coluna.\n"
-    "6. DIFERENCIE GRUPOS DE ITENS: Se a linha for apenas o título de um grupo (ex: '1. SERVIÇOS PRELIMINARES'), classifique o campo tipo como 'grupo'. Se for um serviço com quantidade e valor, classifique como 'item'.\n"
-    "7. REMOÇÃO DE LIXO: Ignore completamente linhas que contenham 'GDF', 'Processo SEI', cabeçalhos de tabela repetidos no meio da página, 'RESUMO GERAL', 'COMPOSIÇÕES', 'MAPA DE COTAÇÃO' e 'BDI'. Foque 100% no ORÇAMENTO DETALHADO.\n\n"
+    "0. ORDEM DAS COLUNAS NO PDF (da esquerda para a direita): Código | Descrição do Serviço | BDI | Unid. | Qtde | Preço Unit. | Preço total. "
+    "O campo JSON 'codigo' vem da coluna Código (ex: CPU6724, 5914351M). O campo 'item' é a numeração hierárquica (ex: 1.1, 2.3) se existir em coluna separada; não repita o código no campo item.\n"
+    "1. IDENTIFICAÇÃO DE COLUNAS POR CABEÇALHO: Localize cada coluna pelo cabeçalho exato antes de extrair valores.\n"
+    "2. EXTRAÇÃO BASEADA EM LINHA: Cada valor deve pertencer à coluna vertical correta. Célula vazia → 0.0. NUNCA desloque Qtde para Preço Unit. ou Preço total.\n"
+    "3. RIGOR COM NÚMEROS E UNIDADES: 'unidade' só com siglas (M2, M3, UN, m, T, TKm). Separe número e unidade se vierem juntos.\n"
+    "4. LIMPEZA MATEMÁTICA: Remova 'R$' e '%'. Converta padrão brasileiro para float (ex: '3.017,500' → 3017.5; '17.260,10' → 17260.10; '20,81' → 20.81).\n"
+    "5. COLUNA BDI (%): Extraia o percentual da coluna BDI de cada linha de serviço (ex: '20,81' ou '20,81%' → 20.81). Não use taxas de páginas de resumo de BDI.\n"
+    "6. FÓRMULA DE CONSISTÊNCIA: quantidade × valor_unitario ≈ valor_total (tolerância ~2%). Se não bater, re-leia a linha e corrija o alinhamento das colunas.\n"
+    "7. DIFERENCIE GRUPOS: Linhas só com título de capítulo ou 'Total do grupo' → tipo 'grupo' (serão ignoradas). Linhas com código de serviço e quantidade → tipo 'item'.\n"
+    "8. REMOÇÃO DE LIXO: Ignore cabeçalhos repetidos, 'RESUMO GERAL', 'COMPOSIÇÕES', 'MAPA DE COTAÇÃO', linhas institucionais.\n\n"
     "FORMATO DE SAÍDA OBRIGATÓRIO (JSON):\n"
     "Retorne um array de objetos JSON chamado orcamento_itens seguindo exatamente este schema:\n"
     "{\n"
@@ -75,6 +78,7 @@ EXTRACTION_SYSTEM_PROMPT = (
     '      "banco": "string",\n'
     '      "codigo": "string",\n'
     '      "descricao": "string",\n'
+    '      "bdi": 0.0,\n'
     '      "unidade": "string",\n'
     '      "quantidade": 0.0,\n'
     '      "valor_unitario": 0.0,\n'
@@ -103,14 +107,26 @@ EXTRACTION_JSON_SCHEMA = {
                         "item": {"type": ["string", "null"]},
                         "tipo": {"type": "string", "enum": ["grupo", "item"]},
                         "banco": {"type": ["string", "null"]},
-                        "codigo": {"type": ["string", "null"]},
+                        "codigo": {"type": "string"},
                         "descricao": {"type": "string"},
-                        "unidade": {"type": ["string", "null"]},
+                        "bdi": {"type": "number"},
+                        "unidade": {"type": "string"},
                         "quantidade": {"type": "number"},
                         "valor_unitario": {"type": "number"},
                         "valor_total": {"type": "number"}
                     },
-                    "required": ["item", "tipo", "banco", "codigo", "descricao", "unidade", "quantidade", "valor_unitario", "valor_total"],
+                    "required": [
+                        "item",
+                        "tipo",
+                        "banco",
+                        "codigo",
+                        "descricao",
+                        "bdi",
+                        "unidade",
+                        "quantidade",
+                        "valor_unitario",
+                        "valor_total",
+                    ],
                     "additionalProperties": False
                 }
             }
@@ -248,6 +264,63 @@ def _coerce_number(value: Any) -> float:
         return 0.0
 
 
+def _coerce_bdi(value: Any) -> float:
+    """Converte BDI com ou sem '%' (ex: '24,53%' -> 24.53)."""
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("%", "").replace(" ", "")
+    return _coerce_number(text)
+
+
+def _apply_line_sanity_check(
+    quantidade: float,
+    valor_unitario: float,
+    valor_total: float,
+) -> tuple[float, float, float]:
+    """Corrige desalinhamento típico entre Qtde, Preço Unit. e Preço total."""
+    if quantidade <= 0:
+        return quantidade, valor_unitario, valor_total
+
+    if valor_unitario <= 0 and valor_total > 0:
+        valor_unitario = valor_total / quantidade
+
+    if valor_total <= 0 and valor_unitario > 0:
+        valor_total = quantidade * valor_unitario
+        return quantidade, valor_unitario, valor_total
+
+    if valor_unitario <= 0:
+        return quantidade, valor_unitario, valor_total
+
+    esperado = quantidade * valor_unitario
+    if valor_total <= 0:
+        return quantidade, valor_unitario, esperado
+
+    erro_relativo = abs(valor_total - esperado) / max(abs(esperado), abs(valor_total), 1.0)
+    if erro_relativo <= 0.02:
+        return quantidade, valor_unitario, valor_total
+
+    # Total do PDF costuma estar correto; realinha unitário
+    if valor_total < esperado * 0.5 or valor_total > esperado * 2.0:
+        vu_corrigido = valor_total / quantidade
+        if vu_corrigido > 0:
+            return quantidade, vu_corrigido, valor_total
+
+    return quantidade, valor_unitario, valor_total
+
+
+def _should_skip_extracted_row(tipo: str, descricao: str, codigo: str) -> bool:
+    if tipo == "grupo":
+        return True
+    desc_lower = descricao.lower()
+    if "total do grupo" in desc_lower:
+        return True
+    if desc_lower.startswith("total ") and not codigo:
+        return True
+    return False
+
+
 def _normalize_structured_items(raw_items: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw_items, list):
         return []
@@ -257,11 +330,15 @@ def _normalize_structured_items(raw_items: Any) -> List[Dict[str, Any]]:
         if not isinstance(item, dict):
             continue
 
-        item_number = item.get("item") or item.get("Item") or item.get("item_numero") or index
-        tipo = item.get("tipo") or "item"
+        item_number = item.get("item") or item.get("Item") or item.get("item_numero") or ""
+        tipo = str(item.get("tipo") or "item").strip().lower()
         banco = item.get("banco") or ""
-        codigo = item.get("codigo") or item.get("Código") or item.get("code") or ""
+        codigo = str(item.get("codigo") or item.get("Código") or item.get("code") or "").strip()
         descricao = item.get("descricao") or item.get("Descrição") or item.get("description") or ""
+        descricao = str(descricao).strip()
+        if _should_skip_extracted_row(tipo, descricao, codigo):
+            continue
+        bdi = _coerce_bdi(item.get("bdi") or item.get("BDI") or item.get("bdi_percentual"))
         unidade = item.get("unidade") or item.get("Unidade") or item.get("unit") or "un"
         quantidade = _coerce_number(item.get("quantidade") or item.get("Quantidade") or item.get("qty"))
         valor_unitario = _coerce_number(
@@ -271,15 +348,11 @@ def _normalize_structured_items(raw_items: Any) -> List[Dict[str, Any]]:
             or item.get("unit_value")
         )
         total = _coerce_number(item.get("valor_total") or item.get("Total") or item.get("total"))
-        if total <= 0 and quantidade and valor_unitario:
-            total = quantidade * valor_unitario
+        quantidade, valor_unitario, total = _apply_line_sanity_check(
+            quantidade, valor_unitario, total
+        )
 
-        # Se for grupo, tentamos manter o formato antigo de grupo ou apenas repassamos
-        grupo_val = ""
-        if tipo == "grupo":
-            grupo_val = str(descricao).strip()
-        else:
-            grupo_val = str(item.get("grupo") or item.get("Grupo") or item.get("grupo_hierarquico") or "").strip()
+        grupo_val = str(item.get("grupo") or item.get("Grupo") or item.get("grupo_hierarquico") or "").strip()
 
         normalized.append(
             {
@@ -289,6 +362,7 @@ def _normalize_structured_items(raw_items: Any) -> List[Dict[str, Any]]:
                 "codigo": str(codigo),
                 "grupo": grupo_val or None,
                 "descricao": str(descricao).strip(),
+                "bdi": bdi,
                 "unidade": str(unidade).strip() or "un",
                 "quantidade": quantidade,
                 "valor_unitario": valor_unitario,
@@ -415,6 +489,7 @@ async def process_selected_table(
     table_rows: List[List[Any]],
     table_page: int,
     table_name: str | None = None,
+    table_image_base64: str | None = None,
 ) -> Tuple[Dict[str, Any], str]:
     """
     Processa a tabela escolhida com GPT-4o e retorna JSON estruturado.
@@ -423,24 +498,19 @@ async def process_selected_table(
     t0 = time.perf_counter()
     client = _get_client()
 
-    EXTRACTION_SYSTEM_PROMPT = (
-        "Você é um Extrator de Dados Analíticos de Engenharia. Você receberá imagens de planilhas de orçamento. Sua tarefa é transcrever os dados com 100% de precisão visual e matemática.\n\n"
-        "REGRA 1 - LEITURA VISUAL: Leia a tabela da ESQUERDA para a DIREITA, acompanhando a linha visual da grade. Nunca misture dados de uma linha com a de baixo.\n"
-        "REGRA 2 - IDENTIFICAÇÃO DE PADRÃO: As colunas seguem esta ordem lógica: [ITEM] -> [DESCRIÇÃO] -> [UNIDADE (ex: M, M2, UN, CHP)] -> [QUANTIDADE] -> [PREÇO UNITÁRIO] -> [PREÇO TOTAL].\n"
-        "REGRA 3 - ANCORAGEM PELA UNIDADE: Procure a coluna de UNIDADE (sempre letras como UN, M2, Mês). O número que está imediatamente à esquerda ou direita dela é a QUANTIDADE. O valor financeiro maior no final da linha é o TOTAL.\n"
-        "REGRA 4 - RASTREAMENTO MATEMÁTICO (OBRIGATÓRIO): Antes de gerar a saída de uma linha, multiplique internamente [QUANTIDADE] x [PREÇO UNITÁRIO]. Se o resultado não for igual ao [PREÇO TOTAL] (tolerância de R$ 0,50), você alinhou as colunas errado. Corrija o alinhamento antes de formatar o JSON.\n"
-        "REGRA 5 - SANEAMENTO: Remova 'R$' e converta valores para float (ex: '20.308,75' vira 20308.75).\n\n"
-        "Traga APENAS os itens que possuem número de ITEM (ex: 1.1, 2.3). Ignore textos soltos, assinaturas e cabeçalhos."
-    )
-
     system_msg = EXTRACTION_SYSTEM_PROMPT
     user_msg = _build_selected_table_prompt(table_rows, table_page, table_id, table_name)
     
-    try:
-        base64_image = _pdf_page_to_base64_image(pdf_content, table_page)
-    except Exception as e:
-        logger.warning(f"Falha ao gerar imagem da página {table_page}: {e}")
-        base64_image = None
+    image_mime = "image/png"
+    if table_image_base64:
+        base64_image = table_image_base64.strip()
+    else:
+        try:
+            base64_image = _pdf_page_to_base64_image(pdf_content, table_page)
+            image_mime = "image/jpeg"
+        except Exception as e:
+            logger.warning(f"Falha ao gerar imagem da página {table_page}: {e}")
+            base64_image = None
 
     input_audit = {
         "table_id": table_id,
@@ -448,7 +518,8 @@ async def process_selected_table(
         "page": table_page,
         "rows_count": len(table_rows),
         "rows_truncated": truncate_rows_for_audit(table_rows, max_rows=10),
-        "has_image": bool(base64_image)
+        "has_image": bool(base64_image),
+        "image_source": "crop" if table_image_base64 else "full_page",
     }
 
     try:
@@ -467,7 +538,7 @@ async def process_selected_table(
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}",
+                            "url": f"data:{image_mime};base64,{base64_image}",
                             "detail": "high"
                         }
                     }
@@ -513,7 +584,7 @@ async def process_selected_table(
             }
 
         structured_output = {
-            "items": raw_items if isinstance(raw_items, list) else [],
+            "items": normalized_items,
             "resumo": summary,
         }
 

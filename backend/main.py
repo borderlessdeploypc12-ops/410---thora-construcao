@@ -48,7 +48,13 @@ from config import (
 from firebase_service import OrcamentoFirestore
 from budget_parser import BudgetParser
 from firebase_admin import auth as firebase_auth
-from services.openai_service import identify_tables, process_selected_table, OpenAIServiceError
+from services.openai_service import (
+    identify_tables,
+    process_selected_table,
+    OpenAIServiceError,
+    _coerce_bdi,
+    _coerce_number,
+)
 from services.ai_audit_logger import log_ai_exchange
 
 try:
@@ -618,6 +624,119 @@ def _extract_tables_from_pdf_path(file_path: Path) -> List[Dict]:
     return tables
 
 
+def _candidate_camelot_index(candidate_id: str) -> int | None:
+    """Índice Camelot alinhado ao id `table-{n}` gerado em detect-tables."""
+    match = re.match(r"^table-(\d+)$", str(candidate_id or "").strip())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _camelot_table_to_rows(camelot_table: Any) -> List[List[Any]]:
+    """Converte tabela Camelot em matriz de linhas para o prompt da IA."""
+    df = camelot_table.df
+    rows: List[List[Any]] = []
+    for _, row in df.iterrows():
+        rows.append(
+            [str(cell).strip() if cell is not None and str(cell) != "nan" else "" for cell in row.tolist()]
+        )
+    return rows
+
+
+def _deduplicate_orcamento_items(items: List[Any]) -> List[Dict[str, Any]]:
+    """Remove itens repetidos após merge de várias tabelas (mesma página)."""
+    seen: set[tuple[str, str, float, float]] = set()
+    result: List[Dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        codigo = str(raw.get("codigo") or raw.get("code") or "").strip().lower()
+        descricao = str(raw.get("descricao") or raw.get("description") or "").strip().lower()[:120]
+        quantidade = round(_coerce_number(raw.get("quantidade") or raw.get("qty")), 4)
+        valor_unitario = round(
+            _coerce_number(raw.get("valor_unitario") or raw.get("unitPrice") or raw.get("unit_value")),
+            2,
+        )
+        key = (codigo, descricao, quantidade, valor_unitario)
+        if key in seen:
+            continue
+        if not codigo and not descricao:
+            continue
+        seen.add(key)
+        result.append(raw)
+    return result
+
+
+def _resolve_rows_for_candidate(
+    candidate_id: str,
+    selected_candidate: Dict[str, Any] | None,
+    all_tables: List[Dict],
+    camelot_tables: Any,
+) -> Tuple[List[List[Any]], int, str]:
+    """
+    Resolve linhas da tabela escolhida pelo índice Camelot (table-N).
+    Evita reutilizar a maior tabela da página para candidatos distintos.
+    """
+    image_b64 = (selected_candidate or {}).get("imagem_base64")
+    camelot_idx = _candidate_camelot_index(candidate_id)
+
+    if camelot_tables is not None and camelot_idx is not None:
+        try:
+            ct = camelot_tables[camelot_idx]
+            rows = _camelot_table_to_rows(ct)
+            page = int(ct.page)
+            logger.info(
+                "Tabela %s resolvida via Camelot índice %s (pág %s, %s linhas)",
+                candidate_id,
+                camelot_idx,
+                page,
+                len(rows),
+            )
+            return rows, page, candidate_id
+        except (IndexError, AttributeError, TypeError) as exc:
+            logger.warning("Falha ao ler Camelot[%s] para %s: %s", camelot_idx, candidate_id, exc)
+
+    if selected_candidate:
+        page = int(
+            selected_candidate.get("num_pagina")
+            or selected_candidate.get("pagina")
+            or 1
+        )
+    else:
+        page = 1
+
+    selected = _find_table_candidate(all_tables, candidate_id)
+    if not selected:
+        page_tables = [
+            t for t in all_tables if int(t.get("page") or 0) == int(page)
+        ]
+        if len(page_tables) == 1:
+            selected = page_tables[0]
+        elif page_tables and camelot_idx is not None:
+            page_tables_sorted = sorted(
+                page_tables,
+                key=lambda t: str(t.get("table_id") or ""),
+            )
+            pick = page_tables_sorted[min(camelot_idx, len(page_tables_sorted) - 1)]
+            selected = pick
+
+    if selected:
+        rows = selected.get("rows") or []
+        resolved_id = str(selected.get("table_id") or candidate_id)
+        page = int(selected.get("page") or page)
+        logger.info(
+            "Tabela %s resolvida via pdfplumber (%s, pág %s, %s linhas)",
+            candidate_id,
+            resolved_id,
+            page,
+            len(rows),
+        )
+        return rows, page, resolved_id
+
+    logger.warning("Nenhuma linha encontrada para candidato %s", candidate_id)
+    return [], page, candidate_id
+
+
 def _find_table_candidate(all_tables: List[Dict], table_id: str) -> Dict | None:
     if not table_id:
         return None
@@ -1181,15 +1300,31 @@ def _normalize_analytic_items(raw_items: List[Any]) -> List[Dict[str, Any]]:
     for idx, it in enumerate(raw_items):
         if not isinstance(it, dict):
             continue
-        q = float(it.get("quantidade") or 0)
-        vu = float(it.get("valor_unitario") or 0)
-        vt = float(it.get("valor_total") or 0)
+        tipo = str(it.get("tipo") or "item").strip().lower()
+        descricao_raw = str(it.get("descricao") or it.get("Descrição") or "").strip()
+        desc_lower = descricao_raw.lower()
+        if tipo == "grupo":
+            continue
+        if "total do grupo" in desc_lower or desc_lower.startswith("total "):
+            continue
+        q = _coerce_number(it.get("quantidade") or it.get("qty"))
+        vu = _coerce_number(
+            it.get("valor_unitario")
+            or it.get("valor_unitário")
+            or it.get("unit_value")
+        )
+        vt = _coerce_number(it.get("valor_total") or it.get("total"))
         if vt <= 0 and q and vu:
             vt = q * vu
         normalized.append(
             {
                 "id": f"item_ai_{idx}",
-                "descricao": str(it.get("descricao", "")).strip(),
+                "item": str(it.get("item") or ""),
+                "tipo": str(it.get("tipo") or "item"),
+                "banco": str(it.get("banco") or ""),
+                "codigo": str(it.get("codigo") or it.get("Código") or it.get("code") or ""),
+                "descricao": str(it.get("descricao") or it.get("Descrição") or "").strip(),
+                "bdi": _coerce_bdi(it.get("bdi") or it.get("BDI")),
                 "quantidade": q,
                 "unidade": str(it.get("unidade", "un") or "un"),
                 "valor_unitario": vu,
@@ -1228,6 +1363,13 @@ async def process_orcamento_confirmed(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erro ao ler PDF: {exc}") from exc
 
+    camelot_tables = None
+    try:
+        camelot_tables = camelot.read_pdf(str(file_path), pages="all", flavor="lattice")
+        logger.info("Camelot: %s tabela(s) carregadas para process-confirmed", len(camelot_tables))
+    except Exception as exc:
+        logger.warning("Camelot indisponível em process-confirmed: %s", exc)
+
     upload_data = _get_upload_data_from_sources(upload_id) or {}
     table_candidates = upload_data.get("table_candidates") or []
     
@@ -1249,24 +1391,35 @@ async def process_orcamento_confirmed(
         if not t_id:
             continue
             
-        selected_candidate = next((item for item in table_candidates if item.get("id") == t_id), None)
+        selected_candidate = next(
+            (item for item in table_candidates if item.get("id") == t_id),
+            None,
+        )
 
-        selected = None
-        if selected_candidate:
-            selected = _find_table_for_page(all_tables, int(selected_candidate.get("num_pagina") or selected_candidate.get("pagina") or 1))
-        if not selected:
-            selected = _find_table_candidate(all_tables, t_id)
-        if not selected:
-            logger.warning(f"Tabela não encontrada para o ID: {t_id}")
-            raise HTTPException(status_code=400, detail=f"Tabela não encontrada para o ID: {t_id}")
+        rows, page, resolved_table_id = _resolve_rows_for_candidate(
+            t_id,
+            selected_candidate,
+            all_tables,
+            camelot_tables,
+        )
+        if not rows:
+            logger.warning("Tabela não encontrada para o ID: %s", t_id)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tabela não encontrada para o ID: {t_id}",
+            )
 
-        rows = selected.get("rows") or []
-        page = int(selected.get("page") or 1)
-        resolved_table_id = str(selected.get("table_id") or t_id)
         candidate_name = str((selected_candidate or {}).get("nome_tabela") or "")
+        table_image_b64 = (selected_candidate or {}).get("imagem_base64")
 
-        # Log para debug do bbox
-        logger.info(f"Processando tabela {resolved_table_id} na página {page}. Bbox: {selected.get('bbox')}")
+        logger.info(
+            "Processando candidato %s → %s na página %s (%s linhas, imagem=%s)",
+            t_id,
+            resolved_table_id,
+            page,
+            len(rows),
+            bool(table_image_b64),
+        )
 
         tables_out.append({
             "page": page,
@@ -1283,10 +1436,14 @@ async def process_orcamento_confirmed(
                 table_rows=rows,
                 table_page=page,
                 table_name=candidate_name,
+                table_image_base64=table_image_b64,
             )
             
-            # Merge items
+            # Merge items (já normalizados pelo openai_service)
             items_this_table = structured_data.get("items") or []
+            for raw_item in items_this_table:
+                if isinstance(raw_item, dict):
+                    raw_item.setdefault("_source_table_id", t_id)
             combined_items.extend(items_this_table)
             
             # Merge resumo
@@ -1315,6 +1472,13 @@ async def process_orcamento_confirmed(
 
     if not combined_items:
         raise HTTPException(status_code=500, detail="Falha ao extrair dados de todas as tabelas selecionadas. Verifique os logs do servidor.")
+
+    combined_items = _deduplicate_orcamento_items(combined_items)
+    logger.info(
+        "Itens após deduplicação: %s (tabelas processadas: %s)",
+        len(combined_items),
+        len(ids_to_process),
+    )
 
     # Normalizar os itens combinados
     normalized_items = _normalize_analytic_items(combined_items)
@@ -2026,6 +2190,85 @@ async def get_curva_abc(
             detail=f"Erro ao calcular Curva ABC: {str(e)}",
         )
 
+def _bdi_factor(bdi_percent: float) -> float:
+    return 1.0 + (bdi_percent / 100.0) if bdi_percent > 0 else 1.0
+
+
+def _prepare_xlsx_export_rows(items: List[Dict]) -> Tuple[List[Dict[str, Any]], float]:
+    """Normaliza itens do front, calcula valores S/BDI e C/BDI e métricas ABC."""
+    prepared: List[Dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        tipo = str(raw.get("tipo") or "item").strip().lower()
+        descricao = str(raw.get("description") or raw.get("descricao") or "").strip()
+        if tipo == "grupo" or "total do grupo" in descricao.lower():
+            continue
+
+        bdi = _coerce_bdi(raw.get("bdi") or raw.get("BDI"))
+        qty = _coerce_number(raw.get("qty") or raw.get("quantidade"))
+        unit_com_bdi = _coerce_number(
+            raw.get("unitPrice") or raw.get("valor_unitario") or raw.get("unitValue")
+        )
+        total_com_bdi = _coerce_number(
+            raw.get("lineTotal")
+            or raw.get("line_total")
+            or raw.get("totalValue")
+            or raw.get("valor_total")
+        )
+        if total_com_bdi <= 0 and qty > 0 and unit_com_bdi > 0:
+            total_com_bdi = qty * unit_com_bdi
+        if unit_com_bdi <= 0 and qty > 0 and total_com_bdi > 0:
+            unit_com_bdi = total_com_bdi / qty
+
+        factor = _bdi_factor(bdi)
+        unit_sem_bdi = unit_com_bdi / factor if factor > 0 else unit_com_bdi
+        total_sem_bdi = total_com_bdi / factor if factor > 0 else total_com_bdi
+        if total_sem_bdi <= 0 and qty > 0 and unit_sem_bdi > 0:
+            total_sem_bdi = qty * unit_sem_bdi
+
+        prepared.append(
+            {
+                "code": str(raw.get("code") or raw.get("codigo") or "").strip(),
+                "description": descricao,
+                "bdi": bdi,
+                "unit": str(raw.get("unit") or raw.get("unidade") or "").strip(),
+                "qty": qty,
+                "unit_sem_bdi": unit_sem_bdi,
+                "unit_com_bdi": unit_com_bdi,
+                "total_sem_bdi": total_sem_bdi,
+                "total_com_bdi": total_com_bdi,
+                "classification": str(raw.get("classification") or raw.get("class") or "").strip().upper(),
+                "accumulated_percentage": raw.get("accumulated_percentage"),
+            }
+        )
+
+    prepared.sort(key=lambda row: row["total_com_bdi"], reverse=True)
+    total_geral = sum(row["total_com_bdi"] for row in prepared)
+
+    accumulated = 0.0
+    for row in prepared:
+        percent = (row["total_com_bdi"] / total_geral * 100.0) if total_geral > 0 else 0.0
+        pct_before = accumulated
+        accumulated += percent
+
+        row["percent"] = percent
+        acc_front = row.get("accumulated_percentage")
+        row["accumulated"] = (
+            float(acc_front) if acc_front is not None and acc_front != "" else accumulated
+        )
+
+        if not row["classification"]:
+            if pct_before < 80:
+                row["classification"] = "A"
+            elif pct_before < 95:
+                row["classification"] = "B"
+            else:
+                row["classification"] = "C"
+
+    return prepared, total_geral
+
+
 # ============== EXPORT XLSX ==============
 @app.post("/api/export-xlsx")
 async def export_xlsx(
@@ -2033,22 +2276,8 @@ async def export_xlsx(
     user_id: str = Depends(get_current_user_id),
 ):
     """
-    Exporta itens da planilha para arquivo XLSX
-    
-    Args:
-        items: Lista de itens [
-            {
-                "id": 1,
-                "code": "001",
-                "description": "Item",
-                "unit": "un",
-                "qty": 10,
-                "unitPrice": 100.00
-            }
-        ]
-    
-    Returns:
-        arquivo XLSX para download
+    Exporta planilha analítica completa (layout cliente):
+    Código, Descrição, BDI, Unid., Quant., custos S/BDI e C/BDI, %, Acumulado, Class.
     """
     try:
         if not Workbook:
@@ -2056,126 +2285,161 @@ async def export_xlsx(
                 status_code=500,
                 detail="openpyxl não está instalado",
             )
-        
-        # Criar workbook
+
+        rows, total_geral = _prepare_xlsx_export_rows(items)
+        if not rows:
+            raise HTTPException(status_code=400, detail="Nenhum item válido para exportar.")
+
         wb = Workbook()
         ws = wb.active
         ws.title = "Orçamento"
-        
-        # Estilos
+
         header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-        header_font = Font(bold=True, color="FFFFFF", size=11)
+        header_font = Font(bold=True, color="FFFFFF", size=10)
         total_fill = PatternFill(start_color="E8F4F8", end_color="E8F4F8", fill_type="solid")
         total_font = Font(bold=True, size=11)
-        currency_fill = PatternFill(start_color="F0F8FF", end_color="F0F8FF", fill_type="solid")
-        
+        zebra_light = PatternFill(start_color="F9FAFB", end_color="F9FAFB", fill_type="solid")
+        zebra_white = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+        class_fills = {
+            "A": PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
+            "B": PatternFill(start_color="FEF08A", end_color="FEF08A", fill_type="solid"),
+            "C": PatternFill(start_color="D1FAE5", end_color="D1FAE5", fill_type="solid"),
+        }
+        class_fonts = {
+            "A": Font(bold=True, color="991B1B"),
+            "B": Font(bold=True, color="854D0E"),
+            "C": Font(bold=True, color="065F46"),
+        }
+
         border = Border(
-            left=Side(style='thin'),
-            right=Side(style='thin'),
-            top=Side(style='thin'),
-            bottom=Side(style='thin')
+            left=Side(style="thin", color="D1D5DB"),
+            right=Side(style="thin", color="D1D5DB"),
+            top=Side(style="thin", color="D1D5DB"),
+            bottom=Side(style="thin", color="D1D5DB"),
         )
-        
-        # Cabeçalho
-        headers = ["Item", "Tipo", "Curva ABC", "Banco", "Código", "Descrição", "Unidade", "Quantidade", "Valor Unitário", "Total"]
+
+        headers = [
+            "Código Serviço",
+            "Descrição",
+            "BDI",
+            "Unidade",
+            "Quantidade",
+            "Custo Unitário S/BDI",
+            "Preço Unitário C/BDI",
+            "Preço Total S/BDI",
+            "Preço Total C/BDI",
+            "%",
+            "Acumulado",
+            "Class.",
+        ]
+        col_count = len(headers)
+
         for col_num, header in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col_num)
             cell.value = header
             cell.font = header_font
             cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell.border = border
-        
-        # Cores Curva ABC
-        fill_A = PatternFill(start_color="FFD6D6", end_color="FFD6D6", fill_type="solid") # red-100
-        fill_B = PatternFill(start_color="FEF08A", end_color="FEF08A", fill_type="solid") # yellow-100
-        fill_C = PatternFill(start_color="D1FAE5", end_color="D1FAE5", fill_type="solid") # emerald-100
 
-        # Dados
-        total_geral = 0
-        for row_num, item in enumerate(items, 2):
-            abc_class = item.get("classification", "")
-            
-            # Determinar o fill da linha baseado na classificação
-            row_fill = None
-            if abc_class == "A":
-                row_fill = fill_A
-            elif abc_class == "B":
-                row_fill = fill_B
-            elif abc_class == "C":
-                row_fill = fill_C
+        right_cols = {3, 5, 6, 7, 8, 9, 10, 11}
+        center_cols = {4, 12}
 
-            ws.cell(row=row_num, column=1).value = item.get("item", "")
-            ws.cell(row=row_num, column=2).value = item.get("tipo", "")
-            ws.cell(row=row_num, column=3).value = abc_class
-            ws.cell(row=row_num, column=4).value = item.get("banco", "")
-            ws.cell(row=row_num, column=5).value = item.get("code", "")
-            ws.cell(row=row_num, column=6).value = item.get("description", "")
-            ws.cell(row=row_num, column=7).value = item.get("unit", "")
-            
-            qty = float(item.get("qty", 0))
-            unit_price = float(item.get("unitPrice", 0))
-            total = qty * unit_price
-            total_geral += total
-            
-            ws.cell(row=row_num, column=8).value = qty
-            ws.cell(row=row_num, column=9).value = unit_price
-            ws.cell(row=row_num, column=10).value = total
-            
-            # Formato moeda para R$
-            ws.cell(row=row_num, column=9).number_format = 'R$ #,##0.00'
-            ws.cell(row=row_num, column=10).number_format = 'R$ #,##0.00'
-            
-            # Aplicar estilos para todas as células da linha
-            for col in range(1, 11):
-                cell = ws.cell(row=row_num, column=col)
+        for idx, row_data in enumerate(rows):
+            row_num = idx + 2
+            stripe = zebra_light if idx % 2 == 0 else zebra_white
+
+            values = [
+                row_data["code"],
+                row_data["description"],
+                row_data["bdi"],
+                row_data["unit"],
+                row_data["qty"],
+                row_data["unit_sem_bdi"],
+                row_data["unit_com_bdi"],
+                row_data["total_sem_bdi"],
+                row_data["total_com_bdi"],
+                row_data["percent"],
+                row_data["accumulated"],
+                row_data["classification"],
+            ]
+            formats = [
+                None,
+                None,
+                '0.00"%"',
+                None,
+                "#,##0.0000",
+                'R$ #,##0.00',
+                '#,##0.000',
+                '#,##0.00',
+                '#,##0.00',
+                '0.00"%"',
+                '0.00"%"',
+                None,
+            ]
+
+            for col_num, value in enumerate(values, 1):
+                cell = ws.cell(row=row_num, column=col_num)
+                cell.value = value
                 cell.border = border
-                if row_fill:
-                    cell.fill = row_fill
-                elif col == 10 and not row_fill:
-                    cell.fill = currency_fill
-                ws.cell(row=row_num, column=col).alignment = Alignment(horizontal="right" if col >= 8 else "left")
-        
-        # Linha de Total
-        total_row = len(items) + 3
-        ws.cell(row=total_row, column=9).value = "TOTAL GERAL:"
+                if formats[col_num - 1]:
+                    cell.number_format = formats[col_num - 1]
+                if col_num in right_cols:
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                elif col_num in center_cols:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+
+                if col_num == 12:
+                    cls = str(row_data.get("classification") or "").strip().upper()
+                    cell.fill = class_fills.get(cls, stripe)
+                    cell.font = class_fonts.get(cls, Font(bold=True))
+                else:
+                    cell.fill = stripe
+
+        total_row = len(rows) + 3
+        ws.cell(row=total_row, column=8).value = "TOTAL GERAL:"
+        ws.cell(row=total_row, column=8).font = total_font
+        ws.cell(row=total_row, column=8).alignment = Alignment(horizontal="right")
+        ws.cell(row=total_row, column=9).value = total_geral
+        ws.cell(row=total_row, column=9).number_format = "#,##0.00"
+        ws.cell(row=total_row, column=9).fill = total_fill
         ws.cell(row=total_row, column=9).font = total_font
-        ws.cell(row=total_row, column=9).alignment = Alignment(horizontal="right")
-        
-        ws.cell(row=total_row, column=10).value = total_geral
-        ws.cell(row=total_row, column=10).number_format = 'R$ #,##0.00'
-        ws.cell(row=total_row, column=10).fill = total_fill
-        ws.cell(row=total_row, column=10).font = total_font
-        ws.cell(row=total_row, column=10).border = border
-        
-        # Ajustar largura das colunas
-        ws.column_dimensions['A'].width = 10
-        ws.column_dimensions['B'].width = 10
-        ws.column_dimensions['C'].width = 10
-        ws.column_dimensions['D'].width = 10
-        ws.column_dimensions['E'].width = 12
-        ws.column_dimensions['F'].width = 40
-        ws.column_dimensions['G'].width = 12
-        ws.column_dimensions['H'].width = 15
-        ws.column_dimensions['I'].width = 15
-        ws.column_dimensions['J'].width = 15
-        
-        # Altura do cabeçalho
-        ws.row_dimensions[1].height = 25
-        
-        # Salvar arquivo
+        ws.cell(row=total_row, column=9).border = border
+
+        col_widths = {
+            "A": 16,
+            "B": 52,
+            "C": 10,
+            "D": 10,
+            "E": 14,
+            "F": 18,
+            "G": 18,
+            "H": 18,
+            "I": 18,
+            "J": 10,
+            "K": 12,
+            "L": 8,
+        }
+        for col_letter, width in col_widths.items():
+            ws.column_dimensions[col_letter].width = width
+
+        ws.row_dimensions[1].height = 28
+        ws.freeze_panes = "A2"
+
         filename = f"orcamento_{uuid.uuid4().hex[:8]}.xlsx"
         file_path = TEMP_FOLDER / filename
         wb.save(file_path)
-        
-        logger.info(f"✅ XLSX gerado: {file_path}")
-        
+
+        logger.info("✅ XLSX analítico gerado: %s (%s itens)", file_path, len(rows))
+
         return FileResponse(
             path=file_path,
             filename=filename,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-    
+
     except HTTPException:
         raise
     except Exception as e:
