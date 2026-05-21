@@ -1,422 +1,429 @@
-import React, { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import {
   Download,
+  FileSpreadsheet,
   FileText,
-  BarChart3,
-  Clock,
-  Trash2,
-  Eye,
-  Plus,
   Loader2,
-  CheckCircle2,
+  MessageSquare,
+  Send,
+  Paperclip,
 } from "lucide-react";
-import jsPDF from "jspdf";
-import { listOrcamentos, getCurvaABC } from "../services/api";
-import ConfirmDialog from "../components/ConfirmDialog";
-import { btnAccent, btnSecondary } from "../components/ui/buttonClasses";
+import { useAuth } from "../features/auth/AuthContext";
+import ChatReportChart from "../components/ChatReportChart";
+import { listOrcamentosByUserId } from "../features/orcamentos/orcamentoRepository";
+import type { Orcamento } from "../features/orcamentos/orcamentoTypes";
+import {
+  aiReportChat,
+  downloadAiAttachment,
+  type AiReportAttachment,
+  type AiReportChart,
+  type AiReportTable,
+} from "../services/api";
+import { prepareItemsForAiReport } from "../features/orcamentos/prepareItemsForAiReport";
+import { btnAccent } from "../components/ui/buttonClasses";
 
-interface Report {
-  id: string;
-  name: string;
-  type: "budget" | "curva-abc" | "comparison" | "financial";
-  createdAt: string;
-  orcamentoName: string;
-  size: string;
-  uploadId?: string;           // present for real uploads
-  itemsFound?: number;
-  hasReviewedItems?: boolean;
-  hasAIAnalysis?: boolean;
+type ChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+  chart?: AiReportChart | null;
+  table?: AiReportTable | null;
+  attachments?: AiReportAttachment[];
+};
+
+const SUGGESTIONS = [
+  "Resumo executivo deste orçamento com totais e destaques",
+  "Quais são os 10 itens de maior valor total?",
+  "Gráfico dos itens com maior quantidade",
+  "Relatório detalhado comparando itens por unidade de medida",
+];
+
+function formatInlineMarkdown(text: string): React.ReactNode {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return (
+        <strong key={i} className="font-semibold text-slate-900">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    return <span key={i}>{part}</span>;
+  });
 }
 
-const MOCK_REPORTS: Report[] = [];
-
-const Reports: React.FC = () => {
-  const navigate = useNavigate();
-  const [reports, setReports] = useState<Report[]>(MOCK_REPORTS);
-  const [filter, setFilter] = useState<string>("all");
-  const [loadingReports, setLoadingReports] = useState(true);
-  const [generatingId, setGeneratingId] = useState<string | null>(null);
-  const [deleteReportId, setDeleteReportId] = useState<string | null>(null);
-
-  // ── Load real uploads from backend on mount ─────────────────────────────
-  useEffect(() => {
-    const fetchReports = async () => {
-      try {
-        const data = await listOrcamentos();
-        const realReports: Report[] = (data.orcamentos || []).map(
-          (o: any, i: number) => ({
-            id: o.uploadId || String(i),
-            name: o.filename || o.uploadId || `Orçamento ${i + 1}`,
-            type: "budget" as const,
-            createdAt: o.uploadedAt
-              ? new Date(o.uploadedAt).toLocaleString("pt-BR")
-              : "—",
-            orcamentoName: o.filename || o.uploadId || "—",
-            size: `${o.itemsFound ?? "?"} itens`,
-            uploadId: o.uploadId,
-            itemsFound: o.itemsFound,
-            hasReviewedItems: o.hasReviewedItems,
-            hasAIAnalysis: o.hasAIAnalysis,
-          }),
-        );
-        setReports(realReports);
-      } catch (err) {
-        console.error("Erro ao carregar orçamentos:", err);
-        setReports([]);
-      } finally {
-        setLoadingReports(false);
-      }
-    };
-    fetchReports();
-  }, []);
-
-  const filteredReports = reports.filter((r) =>
-    filter === "all" ? true : r.type === filter
-  );
-
-  // ── Generate PDF ─────────────────────────────────────────────────────────
-  const handleGenerateReport = async (report: Report) => {
-    setGeneratingId(report.id);
-    try {
-      const pdf = new jsPDF();
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const pageHeight = pdf.internal.pageSize.getHeight();
-      const margin = 15;
-
-      // Header bar
-      pdf.setFillColor(31, 78, 120);
-      pdf.rect(0, 0, pageWidth, 30, "F");
-      pdf.setTextColor(255, 255, 255);
-      pdf.setFontSize(20);
-      pdf.text("Thora Construction", margin, 20);
-
-      // Title
-      pdf.setTextColor(0, 0, 0);
-      pdf.setFontSize(14);
-      pdf.text(report.name, margin, 45);
-
-      pdf.setFontSize(10);
-      pdf.text(`Arquivo: ${report.orcamentoName}`, margin, 56);
-      pdf.text(`Gerado em: ${new Date().toLocaleString("pt-BR")}`, margin, 64);
-
-      let yPos = 78;
-
-      if (report.uploadId) {
-        // ── Real report ────────────────────────────────────────────────────
-        const curvaData = await getCurvaABC(report.uploadId);
-        const items: any[] = curvaData?.items || [];
-
-        const totalValue = items.reduce(
-          (s: number, i: any) => s + Number(i.valor_total || 0),
-          0,
-        );
-        const classA = items.filter((i) => i.classification === "A");
-        const classB = items.filter((i) => i.classification === "B");
-        const classC = items.filter((i) => i.classification === "C");
-
-        // Summary section
-        pdf.setFontSize(12);
-        pdf.setFont(undefined as any, "bold");
-        pdf.text("Resumo do Orçamento", margin, yPos);
-        pdf.setFont(undefined as any, "normal");
-        pdf.setFontSize(10);
-        yPos += 10;
-
-        const summaryLines = [
-          `Total do Orçamento: R$ ${totalValue.toLocaleString("pt-BR", { minimumFractionDigits: 2 })}`,
-          `Total de Itens: ${items.length}`,
-          `Classe A: ${classA.length} itens (alto valor)`,
-          `Classe B: ${classB.length} itens (médio valor)`,
-          `Classe C: ${classC.length} itens (baixo valor)`,
-          report.hasReviewedItems
-            ? "✓ Itens com revisão manual aplicada"
-            : "Itens extraídos automaticamente (sem revisão manual)",
-        ];
-        summaryLines.forEach((line) => {
-          pdf.text(`• ${line}`, margin + 5, yPos);
-          yPos += 8;
-        });
-
-        // Items table
-        yPos += 8;
-        pdf.setFontSize(12);
-        pdf.setFont(undefined as any, "bold");
-        pdf.text("Lista de Itens", margin, yPos);
-        yPos += 8;
-
-        // Table header
-        pdf.setFontSize(8);
-        pdf.setFillColor(240, 244, 248);
-        pdf.rect(margin, yPos, pageWidth - 2 * margin, 7, "F");
-        pdf.setFont(undefined as any, "bold");
-        pdf.text("#", margin + 2, yPos + 5);
-        pdf.text("Descrição", margin + 10, yPos + 5);
-        pdf.text("Qtd", margin + 100, yPos + 5);
-        pdf.text("Un", margin + 118, yPos + 5);
-        pdf.text("V. Unit", margin + 130, yPos + 5);
-        pdf.text("V. Total", margin + 153, yPos + 5);
-        pdf.text("ABC", margin + 173, yPos + 5);
-        yPos += 9;
-
-        pdf.setFont(undefined as any, "normal");
-        items.slice(0, 60).forEach((item: any, idx: number) => {
-          if (yPos > pageHeight - 20) {
-            pdf.addPage();
-            yPos = margin;
-          }
-          if (idx % 2 === 0) {
-            pdf.setFillColor(249, 250, 251);
-            pdf.rect(margin, yPos - 1, pageWidth - 2 * margin, 6.5, "F");
-          }
-          const desc = String(item.descricao || "").substring(0, 45);
-          const qty = Number(item.quantidade || 0).toLocaleString("pt-BR", { maximumFractionDigits: 2 });
-          const unit = String(item.unidade || "un");
-          const vUnit = Number(item.valor_unitario || 0).toLocaleString("pt-BR", {
-            style: "currency",
-            currency: "BRL",
-          });
-          const vTotal = Number(item.valor_total || 0).toLocaleString("pt-BR", {
-            style: "currency",
-            currency: "BRL",
-          });
-          pdf.setFontSize(7.5);
-          pdf.text(String(idx + 1), margin + 2, yPos + 4);
-          pdf.text(desc, margin + 10, yPos + 4);
-          pdf.text(qty, margin + 100, yPos + 4);
-          pdf.text(unit, margin + 118, yPos + 4);
-          pdf.text(vUnit, margin + 130, yPos + 4);
-          pdf.text(vTotal, margin + 153, yPos + 4);
-          pdf.text(item.classification || "—", margin + 173, yPos + 4);
-          yPos += 7;
-        });
-
-        if (items.length > 60) {
-          pdf.setFontSize(8);
-          pdf.setTextColor(120, 120, 120);
-          pdf.text(
-            `... e mais ${items.length - 60} itens (exporte XLSX para lista completa)`,
-            margin,
-            yPos + 5,
+function MarkdownLite({ text }: { text?: string | null }) {
+  const safe = typeof text === "string" ? text : "";
+  if (!safe.trim()) {
+    return (
+      <p className="text-sm text-slate-500 italic">
+        Resposta recebida sem texto. Veja tabela, gráfico ou anexos abaixo.
+      </p>
+    );
+  }
+  const lines = safe.split("\n").filter((l, idx, arr) => l.trim() || idx < arr.length - 1);
+  return (
+    <div className="space-y-2 text-sm leading-relaxed text-slate-800">
+      {lines.map((line, i) => {
+        const trimmed = line.trim();
+        if (!trimmed) return <div key={i} className="h-1" />;
+        if (trimmed.startsWith("## ")) {
+          return (
+            <h3 key={i} className="text-base font-semibold text-slate-900">
+              {formatInlineMarkdown(trimmed.slice(3))}
+            </h3>
           );
-          pdf.setTextColor(0, 0, 0);
         }
-      } else {
-        // ── Fallback: static report ────────────────────────────────────────
-        pdf.setFontSize(12);
-        pdf.setFont(undefined as any, "bold");
-        pdf.text("Resumo Executivo", margin, yPos);
-        pdf.setFontSize(10);
-        pdf.setFont(undefined as any, "normal");
-        yPos += 12;
-        pdf.text("Nenhum dado real disponível para este relatório.", margin, yPos);
-      }
+        if (trimmed.startsWith("### ")) {
+          return (
+            <h4 key={i} className="font-semibold text-slate-900">
+              {formatInlineMarkdown(trimmed.slice(4))}
+            </h4>
+          );
+        }
+        if (trimmed.startsWith("- ") || /^\d+\.\s/.test(trimmed)) {
+          return (
+            <p key={i} className="pl-1">
+              {formatInlineMarkdown(trimmed)}
+            </p>
+          );
+        }
+        return <p key={i}>{formatInlineMarkdown(trimmed)}</p>;
+      })}
+    </div>
+  );
+}
 
-      // Footer
-      pdf.setFontSize(8);
-      pdf.setTextColor(128, 128, 128);
-      pdf.text(
-        `Gerado em ${new Date().toLocaleString("pt-BR")} · Thora Construction`,
-        margin,
-        pageHeight - 10,
-      );
+function InlineTable({ table }: { table: AiReportTable }) {
+  return (
+    <div className="mt-3 overflow-x-auto rounded-lg border border-slate-200">
+      <p className="border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-700">
+        {table.title}
+      </p>
+      <table className="w-full min-w-[280px] text-left text-xs">
+        {table.headers?.length > 0 && (
+          <thead className="bg-slate-50 text-slate-600">
+            <tr>
+              {table.headers.map((h, i) => (
+                <th key={i} className="px-3 py-2 font-medium">
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+        )}
+        <tbody className="divide-y divide-slate-100">
+          {(table.rows ?? []).slice(0, 30).map((row, ri) => (
+            <tr key={ri}>
+              {(Array.isArray(row) ? row : []).map((cell, ci) => (
+                <td key={ci} className="px-3 py-2 text-slate-800">
+                  {String(cell)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
-      pdf.save(`${report.name.replace(/\s+/g, "_")}.pdf`);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      toast.error("Erro ao gerar PDF", { description: msg });
-    } finally {
-      setGeneratingId(null);
+function AttachmentChips({ attachments }: { attachments: AiReportAttachment[] }) {
+  if (!attachments.length) return null;
+
+  const iconFor = (mime: string, name: string) => {
+    if (mime.includes("csv") || name.endsWith(".csv")) {
+      return <FileSpreadsheet className="h-4 w-4 text-emerald-600" />;
     }
-  };
-
-  const confirmRemoveFromList = () => {
-    if (deleteReportId == null) return;
-    setReports((prev) => prev.filter((r) => r.id !== deleteReportId));
-    setDeleteReportId(null);
-    toast.success("Removido da lista local", {
-      description: "O arquivo no servidor não foi apagado.",
-    });
+    return <FileText className="h-4 w-4 text-blue-600" />;
   };
 
   return (
-    <div className="flex min-h-full flex-col bg-slate-50 pb-16">
-      <ConfirmDialog
-        open={deleteReportId !== null}
-        title="Remover da lista?"
-        description="O orçamento continua salvo; apenas some desta visualização até a próxima atualização."
-        confirmLabel="Remover"
-        cancelLabel="Cancelar"
-        variant="danger"
-        onConfirm={confirmRemoveFromList}
-        onCancel={() => setDeleteReportId(null)}
-      />
+    <div className="mt-3 flex flex-wrap gap-2">
+      {attachments.map((att) => (
+        <button
+          key={att.filename}
+          type="button"
+          onClick={() => {
+            downloadAiAttachment(att);
+            toast.success("Download iniciado", { description: att.filename });
+          }}
+          className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-left text-xs font-medium text-slate-800 transition hover:border-blue-300 hover:bg-blue-50"
+        >
+          {iconFor(att.mime_type, att.filename)}
+          <span className="max-w-[180px] truncate">{att.filename}</span>
+          <Download className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+        </button>
+      ))}
+    </div>
+  );
+}
 
-      <header className="border-b border-slate-200 bg-white px-4 py-5 shadow-sm sm:px-8 sm:py-6">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight text-slate-900 sm:text-3xl">
-              Relatórios
-            </h1>
-            <p className="mt-1 text-sm text-slate-600">
-              PDFs gerados com os dados reais dos orçamentos enviados
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() => navigate("/orcamento")}
-            className={`${btnAccent} shrink-0`}
-          >
-            <Plus className="h-5 w-5" />
-            Novo Orçamento
-          </button>
-        </div>
+const Reports: React.FC = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { user } = useAuth();
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
+  const [orcamentos, setOrcamentos] = useState<Orcamento[]>([]);
+  const [loadingList, setLoadingList] = useState(true);
+  const [selectedId, setSelectedId] = useState<string>("");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+
+  const loadOrcamentos = useCallback(async () => {
+    if (!user?.uid) return;
+    setLoadingList(true);
+    try {
+      const data = await listOrcamentosByUserId(user.uid);
+      const completed = data.filter(
+        (o) => o.status === "completed" && Array.isArray(o.items) && o.items.length > 0,
+      );
+      setOrcamentos(completed);
+      const preselect = (location.state as { uploadId?: string } | null)?.uploadId;
+      setSelectedId((current) => {
+        if (preselect && completed.some((o) => o.uploadId === preselect)) return preselect;
+        if (current && completed.some((o) => o.uploadId === current)) return current;
+        return completed[0]?.uploadId ?? "";
+      });
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : "Erro ao carregar orçamentos");
+    } finally {
+      setLoadingList(false);
+    }
+  }, [user?.uid, location.state]);
+
+  useEffect(() => {
+    void loadOrcamentos();
+  }, [loadOrcamentos]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, sending]);
+
+  const selected = useMemo(
+    () => orcamentos.find((o) => o.uploadId === selectedId),
+    [orcamentos, selectedId],
+  );
+
+  const sendMessage = async (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed || !selected?.items?.length) return;
+
+    setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
+    setInput("");
+    setSending(true);
+
+    try {
+      const preparedItems = prepareItemsForAiReport(selected.items);
+
+      const result = await aiReportChat(trimmed, preparedItems, {
+        filename: selected.filename,
+        uploadId: selected.uploadId,
+      });
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: result.reply || "Análise concluída.",
+          chart: result.chart ?? undefined,
+          table: result.table ?? undefined,
+          attachments: result.attachments ?? [],
+        },
+      ]);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Erro na IA";
+      toast.error(msg);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: `Não foi possível analisar o orçamento: **${msg}**`,
+        },
+      ]);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className="flex h-[calc(100vh-0px)] min-h-0 flex-col bg-slate-50 lg:h-screen">
+      <header className="shrink-0 border-b border-slate-200 bg-white px-4 py-4 shadow-sm sm:px-6">
+        <h1 className="text-xl font-bold text-slate-900 sm:text-2xl">Relatórios</h1>
+        <p className="mt-0.5 text-sm text-slate-600">
+          Pergunte qualquer coisa sobre o orçamento — análises, tabelas, gráficos ou
+          relatórios. A resposta e os arquivos para download vêm no chat.
+        </p>
       </header>
 
-      {/* Main Content */}
-      <main className="flex-1 overflow-auto p-8">
-        {/* Filtros */}
-        <div className="mb-8 flex gap-3 flex-wrap">
-          {[
-            { value: "all", label: "Todos" },
-            { value: "budget", label: "Orçamentos" },
-          ].map((f) => (
-            <button
-              type="button"
-              key={f.value}
-              onClick={() => setFilter(f.value)}
-              className={`rounded-xl px-4 py-2 text-sm font-medium transition ${
-                filter === f.value
-                  ? "bg-blue-600 text-white shadow-sm"
-                  : "border border-slate-200 bg-white text-slate-700 hover:border-slate-300"
-              }`}
-            >
-              {f.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Loading skeleton */}
-        {loadingReports ? (
-          <div className="flex items-center justify-center h-48 gap-3 text-slate-500">
-            <Loader2 className="w-6 h-6 animate-spin" />
-            <span>Carregando orçamentos…</span>
-          </div>
-        ) : filteredReports.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-96 text-center">
-            <FileText className="w-16 h-16 text-slate-300 mb-4" />
-            <p className="text-slate-600 text-lg font-medium">
-              Nenhum orçamento encontrado
-            </p>
-            <p className="text-slate-500 text-sm mt-1">
-              Envie um PDF na aba{" "}
+      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+        <aside className="shrink-0 border-b border-slate-200 bg-white p-4 lg:w-64 lg:border-b-0 lg:border-r">
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Orçamento
+          </p>
+          {loadingList ? (
+            <div className="flex items-center gap-2 text-sm text-slate-500">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Carregando…
+            </div>
+          ) : orcamentos.length === 0 ? (
+            <p className="text-sm text-slate-500">
+              Nenhum orçamento finalizado.{" "}
               <button
                 type="button"
-                className="font-medium text-blue-600 underline-offset-2 hover:underline"
+                className="font-medium text-blue-600 hover:underline"
                 onClick={() => navigate("/orcamento")}
               >
-                Novo Orçamento
-              </button>{" "}
-              para gerar relatórios reais.
+                Criar um
+              </button>
             </p>
+          ) : (
+            <ul className="max-h-40 space-y-1 overflow-y-auto lg:max-h-[calc(100vh-8rem)]">
+              {orcamentos.map((o) => (
+                <li key={o.id}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedId(o.uploadId);
+                      setMessages([]);
+                    }}
+                    className={`w-full rounded-lg px-3 py-2 text-left text-sm transition ${
+                      selectedId === o.uploadId
+                        ? "bg-blue-600 text-white"
+                        : "text-slate-700 hover:bg-slate-100"
+                    }`}
+                  >
+                    <span className="block truncate font-medium">
+                      {o.filename || o.uploadId}
+                    </span>
+                    <span
+                      className={`text-xs ${
+                        selectedId === o.uploadId ? "text-blue-100" : "text-slate-500"
+                      }`}
+                    >
+                      {o.itemsFound ?? o.items.length} itens
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </aside>
+
+        <section className="flex min-h-0 flex-1 flex-col bg-white">
+          <div className="flex items-center gap-2 border-b border-slate-100 px-4 py-2.5">
+            <MessageSquare className="h-5 w-5 text-violet-600" />
+            <span className="text-sm font-medium text-slate-800">
+              {selected
+                ? `Análise: ${selected.filename || selected.uploadId}`
+                : "Selecione um orçamento"}
+            </span>
           </div>
-        ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {filteredReports.map((report) => {
-              const isGenerating = generatingId === report.id;
-              return (
-                <div
-                  key={report.id}
-                  className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition hover:shadow-md"
-                >
-                  <div className="flex items-start justify-between mb-3">
-                    <div className="flex-1 min-w-0">
-                      <h3
-                        className="text-base font-semibold text-slate-900 mb-1 truncate"
-                        title={report.name}
-                      >
-                        {report.name}
-                      </h3>
-                      {/* Status badges */}
-                      <div className="flex flex-wrap gap-1.5 mt-1">
-                        <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
-                          Orçamento
-                        </span>
-                        {report.hasReviewedItems && (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
-                            <CheckCircle2 className="w-3 h-3" />
-                            Revisado
-                          </span>
-                        )}
-                        {report.hasAIAnalysis && (
-                          <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
-                            Análise IA
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                    <FileText className="w-8 h-8 text-slate-300 ml-3 flex-shrink-0" />
-                  </div>
 
-                  <div className="space-y-1.5 mb-5 text-sm text-slate-600">
-                    <p className="flex items-center gap-2">
-                      <BarChart3 className="w-4 h-4 flex-shrink-0" />
-                      <span className="truncate">{report.orcamentoName}</span>
-                    </p>
-                    <p className="flex items-center gap-2">
-                      <Clock className="w-4 h-4 flex-shrink-0" />
-                      {report.createdAt}
-                    </p>
-                    {report.itemsFound !== undefined && (
-                      <p className="text-slate-400 text-xs pl-6">
-                        {report.itemsFound} itens extraídos
-                      </p>
-                    )}
-                  </div>
-
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+            <div className="mx-auto max-w-3xl space-y-4">
+              {messages.length === 0 && selected && (
+                <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50/80 p-5">
+                  <p className="mb-3 text-sm text-slate-600">
+                    Exemplos sobre <strong>{selected.filename}</strong>:
+                  </p>
                   <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      disabled={isGenerating}
-                      onClick={() => handleGenerateReport(report)}
-                      className={`${btnAccent} min-h-[2.5rem] flex-1 py-2 text-sm disabled:opacity-60`}
-                    >
-                      {isGenerating ? (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      ) : (
-                        <Download className="w-4 h-4" />
-                      )}
-                      {isGenerating ? "Gerando…" : "Baixar PDF"}
-                    </button>
-                    {report.uploadId && (
+                    {SUGGESTIONS.map((s) => (
                       <button
+                        key={s}
                         type="button"
-                        onClick={() =>
-                          navigate(`/analise-detalhada/${report.uploadId}`)
-                        }
-                        className={`${btnSecondary} min-h-[2.5rem] flex-1 py-2 text-sm`}
+                        onClick={() => void sendMessage(s)}
+                        disabled={sending}
+                        className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-left text-xs text-slate-700 transition hover:border-violet-300 hover:bg-violet-50"
                       >
-                        <Eye className="w-4 h-4" />
-                        Ver análise
+                        {s}
                       </button>
+                    ))}
+                  </div>
+                  <p className="mt-4 flex items-center gap-1.5 text-xs text-slate-500">
+                    <Paperclip className="h-3.5 w-3.5" />
+                    Arquivos .md e .csv para download aparecem nas respostas da IA.
+                  </p>
+                </div>
+              )}
+
+              {messages.map((m, i) => (
+                <div
+                  key={i}
+                  className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
+                >
+                  <div
+                    className={`max-w-[92%] rounded-2xl px-4 py-3 sm:max-w-[85%] ${
+                      m.role === "user"
+                        ? "bg-blue-600 text-white"
+                        : "border border-slate-200 bg-slate-50/50 text-slate-800 shadow-sm"
+                    }`}
+                  >
+                    {m.role === "user" ? (
+                      <p className="text-sm whitespace-pre-wrap">
+                        {m.content ?? ""}
+                      </p>
+                    ) : (
+                      <>
+                        <MarkdownLite text={m.content} />
+                        {m.table && <InlineTable table={m.table} />}
+                        {m.chart && m.chart.data?.length > 0 && (
+                          <ChatReportChart chart={m.chart} />
+                        )}
+                        {m.attachments && m.attachments.length > 0 && (
+                          <AttachmentChips attachments={m.attachments} />
+                        )}
+                      </>
                     )}
-                    <button
-                      type="button"
-                      onClick={() => setDeleteReportId(report.id)}
-                      className="inline-flex min-h-[2.5rem] items-center justify-center gap-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-red-700 transition hover:bg-red-100"
-                      title="Remover da lista"
-                      aria-label="Remover relatório da lista"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </button>
                   </div>
                 </div>
-              );
-            })}
+              ))}
+
+              {sending && (
+                <div className="flex items-center gap-2 text-sm text-slate-500">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Analisando orçamento…
+                </div>
+              )}
+              <div ref={chatEndRef} />
+            </div>
           </div>
-        )}
-      </main>
+
+          <form
+            className="shrink-0 border-t border-slate-200 bg-white p-4"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void sendMessage(input);
+            }}
+          >
+            <div className="mx-auto flex max-w-3xl gap-2">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                disabled={!selected || sending}
+                placeholder={
+                  selected
+                    ? "Ex.: faça um relatório dos itens classe A com valores e observações"
+                    : "Selecione um orçamento à esquerda"
+                }
+                className="flex-1 rounded-xl border border-slate-200 px-4 py-3 text-sm focus:border-violet-400 focus:outline-none focus:ring-2 focus:ring-violet-200"
+              />
+              <button
+                type="submit"
+                disabled={!selected || sending || !input.trim()}
+                className={`${btnAccent} shrink-0 px-5`}
+                aria-label="Enviar"
+              >
+                <Send className="h-4 w-4" />
+              </button>
+            </div>
+          </form>
+        </section>
+      </div>
     </div>
   );
 };

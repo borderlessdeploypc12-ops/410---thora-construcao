@@ -4,7 +4,7 @@ import NovoOrcamento from "./pages/NovoOrcamento";
 import ValidacaoOrcamento from "./pages/ValidacaoOrcamento";
 import CurvaABC from "./pages/CurvaABC";
 import Reports from "./pages/Reports";
-import Analytics from "./pages/Analytics";
+import ValidacaoInicio from "./pages/ValidacaoInicio";
 import AnaliseDetalhada from "./pages/AnaliseDetalhada";
 import Login from "./pages/Login";
 import Cadastro from "./pages/Cadastro";
@@ -22,14 +22,14 @@ const App = () => {
         <Route path="/" element={<Dashboard />} />
         <Route path="/orcamento" element={<NovoOrcamento />} />
         <Route path="/validacao/:uploadId" element={<ValidacaoOrcamento />} />
-        <Route path="/validacao" element={<ValidacaoOrcamento />} />
+        <Route path="/validacao" element={<ValidacaoInicio />} />
         <Route path="/curva-abc/:uploadId" element={<CurvaABC />} />
         <Route
           path="/analise-detalhada/:uploadId"
           element={<AnaliseDetalhada />}
         />
         <Route path="/relatorios" element={<Reports />} />
-        <Route path="/analytics" element={<Analytics />} />
+        <Route path="/analytics" element={<Navigate to="/" replace />} />
       </Route>
 
       {/* Fallback */}

@@ -351,6 +351,151 @@ export const getAIAnalysis = async (uploadId: string) => {
   }
 };
 
+export const getOrcamentoPdf = async (uploadId: string): Promise<Blob | null> => {
+  try {
+    const response = await apiClient.get(`/api/orcamentos/${uploadId}/pdf`, {
+      responseType: "blob",
+    });
+    return response.data as Blob;
+  } catch {
+    return null;
+  }
+};
+
+export type AiReportChartPoint = { name: string; value: number };
+
+export type AiReportChart = {
+  title: string;
+  chart_type: "bar" | "pie" | "line" | "horizontal_bar";
+  value_label?: "quantidade" | "valor" | "percentual" | string;
+  data: AiReportChartPoint[];
+};
+
+export type AiReportTable = {
+  title: string;
+  headers: string[];
+  rows: (string | number)[][];
+};
+
+export type AiReportAttachment = {
+  filename: string;
+  mime_type: string;
+  content_base64: string;
+};
+
+export type AiReportChatResponse = {
+  reply: string;
+  response_type: string;
+  chart?: AiReportChart | null;
+  table?: AiReportTable | null;
+  attachments?: AiReportAttachment[];
+};
+
+/** Normaliza resposta da API (formato novo ou legado só com explanation/title). */
+export function normalizeAiReportResponse(raw: Record<string, unknown>): AiReportChatResponse {
+  const reply =
+    typeof raw.reply === "string" && raw.reply.trim()
+      ? raw.reply
+      : typeof raw.explanation === "string" && raw.explanation.trim()
+        ? raw.explanation
+        : typeof raw.title === "string" && raw.title.trim()
+          ? raw.title
+          : "Análise concluída. Confira gráfico, tabela ou anexos abaixo.";
+
+  let chart: AiReportChatResponse["chart"] = null;
+  const rawChart = raw.chart;
+  if (rawChart && typeof rawChart === "object") {
+    const c = rawChart as Record<string, unknown>;
+    if (Array.isArray(c.data) && c.data.length > 0) {
+      chart = {
+        title: String(c.title ?? raw.title ?? "Gráfico"),
+        chart_type: (c.chart_type as AiReportChart["chart_type"]) ?? "bar",
+        value_label: String(c.value_label ?? "valor"),
+        data: c.data as AiReportChart["data"],
+      };
+    }
+  } else if (Array.isArray(raw.data) && raw.data.length > 0) {
+    chart = {
+      title: String(raw.title ?? "Gráfico"),
+      chart_type: (raw.chart_type as AiReportChart["chart_type"]) ?? "bar",
+      value_label: "valor",
+      data: raw.data as AiReportChart["data"],
+    };
+  }
+
+  let table: AiReportChatResponse["table"] = null;
+  const rawTable = raw.table;
+  if (rawTable && typeof rawTable === "object") {
+    const t = rawTable as Record<string, unknown>;
+    if (Array.isArray(t.rows) && t.rows.length > 0) {
+      table = {
+        title: String(t.title ?? "Tabela"),
+        headers: Array.isArray(t.headers) ? (t.headers as string[]) : [],
+        rows: t.rows as AiReportTable["rows"],
+      };
+    }
+  }
+
+  const attachments = Array.isArray(raw.attachments)
+    ? (raw.attachments as AiReportAttachment[])
+    : [];
+
+  return {
+    reply,
+    response_type: String(raw.response_type ?? "text"),
+    chart,
+    table,
+    attachments,
+  };
+}
+
+export const aiReportChat = async (
+  message: string,
+  items: unknown[],
+  meta?: { filename?: string; uploadId?: string },
+): Promise<AiReportChatResponse> => {
+  try {
+    const response = await apiClient.post("/api/ai-report-chat", {
+      message,
+      items,
+      filename: meta?.filename ?? "orcamento",
+      upload_id: meta?.uploadId ?? "",
+    });
+    const data = response.data;
+    if (data && typeof data === "object") {
+      return normalizeAiReportResponse(data as Record<string, unknown>);
+    }
+    return {
+      reply: "Resposta vazia do servidor.",
+      response_type: "text",
+      chart: null,
+      table: null,
+      attachments: [],
+    };
+  } catch (error: any) {
+    throw new Error(
+      error.response?.data?.detail || "Erro ao gerar relatório com IA",
+    );
+  }
+};
+
+export function downloadAiAttachment(att: AiReportAttachment): void {
+  const binary = atob(att.content_base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const blob = new Blob([bytes], { type: att.mime_type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = att.filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 export const saveReviewedItems = async (uploadId: string, items: any[]) => {
   try {
     const response = await apiClient.post(

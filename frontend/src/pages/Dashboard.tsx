@@ -5,6 +5,11 @@ import { RefreshCw } from "lucide-react";
 import { useAuth } from "../features/auth/AuthContext";
 import { listOrcamentosByUserId } from "../features/orcamentos/orcamentoRepository";
 import type { Orcamento } from "../features/orcamentos/orcamentoTypes";
+import {
+  formatCurrency,
+  getOrcamentoTotal,
+} from "../features/orcamentos/orcamentoAnalytics";
+import OrcamentoAnalyticsCharts from "../components/OrcamentoAnalyticsCharts";
 import { btnPrimary, btnSecondary } from "../components/ui/buttonClasses";
 
 interface ResumoCardProps {
@@ -13,6 +18,8 @@ interface ResumoCardProps {
   descricao: string;
   extra?: string;
   variant: "blue" | "gray" | "yellow" | "green";
+  /** Classe extra no valor (ex.: moeda longa precisa de fonte menor) */
+  valorClassName?: string;
 }
 
 const variantStyles = {
@@ -28,17 +35,27 @@ const ResumoCard: React.FC<ResumoCardProps> = ({
   descricao,
   extra,
   variant,
+  valorClassName,
 }) => {
+  const valorSize =
+    valorClassName ??
+    (valor.length > 12
+      ? "text-xl sm:text-2xl"
+      : "text-3xl sm:text-4xl");
+
   return (
     <div
-      className={`rounded-2xl border p-6 ${variantStyles[variant]} flex flex-col gap-2`}
+      className={`flex min-w-0 flex-col gap-2 rounded-2xl border p-6 ${variantStyles[variant]}`}
     >
       <p className="text-sm text-slate-600">{titulo}</p>
-      <p className="text-4xl font-bold tabular-nums">{valor}</p>
+      <p
+        className={`font-bold tabular-nums leading-tight tracking-tight break-words ${valorSize}`}
+        title={valor}
+      >
+        {valor}
+      </p>
       <p className="text-sm text-slate-600">{descricao}</p>
-      {extra && (
-        <p className="text-sm font-medium text-emerald-600">{extra}</p>
-      )}
+      {extra && <p className="text-sm font-medium text-emerald-600">{extra}</p>}
     </div>
   );
 };
@@ -68,15 +85,22 @@ const Dashboard: React.FC = () => {
   }, [user?.uid]);
 
   useEffect(() => {
-    fetchOrcamentos();
+    void fetchOrcamentos();
   }, [fetchOrcamentos]);
 
   const stats = useMemo(() => {
     const total = orcamentos.length;
     const processing = orcamentos.filter((o) => o.status === "processing").length;
-    const completed = orcamentos.filter((o) => o.status === "completed").length;
+    const completed = orcamentos.filter((o) => o.status === "completed");
     const error = orcamentos.filter((o) => o.status === "error").length;
-    return { total, processing, completed, error };
+    const valorExportado = completed.reduce((s, o) => s + getOrcamentoTotal(o), 0);
+    return {
+      total,
+      processing,
+      completed: completed.length,
+      error,
+      valorExportado,
+    };
   }, [orcamentos]);
 
   return (
@@ -85,10 +109,10 @@ const Dashboard: React.FC = () => {
         <div className="mb-8 flex flex-col gap-4 sm:mb-10 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h1 className="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl">
-              Torre de Controle
+              Dashboard
             </h1>
             <p className="mt-1 text-slate-600">
-              Gerencie todos os seus orçamentos de obra em um só lugar
+              Visão geral dos orçamentos analisados e exportados
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -117,7 +141,7 @@ const Dashboard: React.FC = () => {
           </div>
         )}
 
-        <div className="mb-10 grid grid-cols-1 gap-4 sm:grid-cols-2 sm:gap-6 lg:grid-cols-4">
+        <div className="mb-10 grid grid-cols-1 gap-4 sm:grid-cols-2 sm:gap-6 lg:grid-cols-4 [&>*]:min-w-0">
           <ResumoCard
             titulo="Total de Orçamentos"
             valor={loading ? "—" : String(stats.total)}
@@ -131,20 +155,27 @@ const Dashboard: React.FC = () => {
             variant="gray"
           />
           <ResumoCard
-            titulo="Com erro"
-            valor={loading ? "—" : String(stats.error)}
-            descricao="Precisam de atenção"
-            variant="yellow"
+            titulo="Analisados / exportados"
+            valor={loading ? "—" : String(stats.completed)}
+            descricao="Prontos para validação e relatórios"
+            variant="green"
           />
           <ResumoCard
-            titulo="Finalizados"
-            valor={loading ? "—" : String(stats.completed)}
-            descricao="Concluídos com sucesso"
-            variant="green"
+            titulo="Valor consolidado"
+            valor={loading ? "—" : formatCurrency(stats.valorExportado)}
+            descricao="Soma dos orçamentos finalizados"
+            variant="yellow"
+            valorClassName="text-base sm:text-lg lg:text-xl"
           />
         </div>
 
-        <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <OrcamentoAnalyticsCharts
+          orcamentos={orcamentos}
+          loading={loading}
+          onRefresh={() => void fetchOrcamentos()}
+        />
+
+        <div className="mt-10 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
           <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6 sm:py-5">
             <h2 className="text-lg font-semibold text-slate-900">
               Orçamentos recentes
@@ -154,7 +185,7 @@ const Dashboard: React.FC = () => {
               onClick={() => navigate("/relatorios")}
               className={`${btnPrimary} w-full sm:w-auto`}
             >
-              Ver todos
+              Relatórios com IA
             </button>
           </div>
 
@@ -166,7 +197,7 @@ const Dashboard: React.FC = () => {
                   <th className="px-4 py-3 sm:px-6 sm:py-4">Status</th>
                   <th className="px-4 py-3 text-right sm:px-6 sm:py-4">Valor total</th>
                   <th className="px-4 py-3 text-right sm:px-6 sm:py-4">Itens</th>
-                  <th className="px-4 py-3 text-right sm:px-6 sm:py-4">Atualizado</th>
+                  <th className="px-4 py-3 text-right sm:px-6 sm:py-4">Ações</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200">
@@ -219,11 +250,10 @@ const Dashboard: React.FC = () => {
                           ? "bg-blue-100 text-blue-800"
                           : "bg-red-100 text-red-800";
 
-                    const updatedAt = (
-                      o.updatedAt ??
-                      o.extractedAt ??
-                      o.uploadedAt
-                    ).toLocaleString("pt-BR");
+                    const valor =
+                      o.status === "completed"
+                        ? formatCurrency(getOrcamentoTotal(o))
+                        : "—";
 
                     return (
                       <tr key={o.id} className="hover:bg-slate-50/80">
@@ -232,7 +262,7 @@ const Dashboard: React.FC = () => {
                             {o.filename || o.uploadId}
                           </p>
                           <p className="text-xs text-slate-500">
-                            Upload: {o.uploadedAt.toLocaleDateString("pt-BR")}
+                            {o.uploadedAt.toLocaleDateString("pt-BR")}
                           </p>
                         </td>
                         <td className="px-4 py-4 sm:px-6">
@@ -242,14 +272,35 @@ const Dashboard: React.FC = () => {
                             {statusLabel}
                           </span>
                         </td>
-                        <td className="px-4 py-4 text-right text-slate-600 sm:px-6">
-                          —
+                        <td className="px-4 py-4 text-right font-medium tabular-nums sm:px-6">
+                          {valor}
                         </td>
                         <td className="px-4 py-4 text-right tabular-nums sm:px-6">
                           {o.itemsFound ?? "—"}
                         </td>
-                        <td className="px-4 py-4 text-right text-slate-500 sm:px-6">
-                          {updatedAt}
+                        <td className="px-4 py-4 text-right sm:px-6">
+                          {o.status === "completed" && (
+                            <div className="flex justify-end gap-2">
+                              <button
+                                type="button"
+                                className="text-xs font-medium text-blue-600 hover:underline"
+                                onClick={() => navigate(`/validacao/${o.uploadId}`)}
+                              >
+                                Validar
+                              </button>
+                              <button
+                                type="button"
+                                className="text-xs font-medium text-violet-600 hover:underline"
+                                onClick={() =>
+                                  navigate("/relatorios", {
+                                    state: { uploadId: o.uploadId },
+                                  })
+                                }
+                              >
+                                Relatório
+                              </button>
+                            </div>
+                          )}
                         </td>
                       </tr>
                     );

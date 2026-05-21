@@ -16,33 +16,33 @@ import {
   CheckCircle2,
 } from "lucide-react";
 import { toast } from "sonner";
-import { exportToXLSX } from "../services/api";
+import {
+  exportToXLSX,
+  getOrcamento,
+  getOrcamentoFromFirebase,
+  getOrcamentoPdf,
+} from "../services/api";
 import { useAuth } from "../features/auth/AuthContext";
 import { upsertOrcamento } from "../features/orcamentos/orcamentoRepository";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { btnAccent, btnMuted, btnSuccess, iconButton } from "../components/ui/buttonClasses";
+import {
+  type OrcamentoItem,
+  recalcularCurvaABC,
+  calcularResumoAbc,
+  parseEditableNumber,
+  unitPriceSemBdiFromComBdi,
+  isExecutiveItem,
+} from "../features/orcamentos/recalcularCurvaABC";
 
 // --- CONFIGURAÇÃO OBRIGATÓRIA DO WORKER (PARA VITE) ---
 // `?url` faz o Vite emitir o arquivo estático com URL correta (evita CORS do CDN e 404 por path relativo a esta página).
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
 
-// --- INTERFACES ---
-interface ItemOrcamento {
-  id: number;
-  item?: string;
-  tipo?: string;
-  banco?: string;
-  code: string;
-  description: string;
-  bdi: number;
-  unit: string;
-  qty: number;
-  unitPrice: number;
-  lineTotal: number;
-  selected?: boolean;
-  classification?: "A" | "B" | "C";
-  accumulated_percentage?: number;
-}
+type ItemOrcamento = OrcamentoItem;
+
+const EDITABLE_NUMERIC_CLASS =
+  "w-full rounded-md border border-slate-200/90 bg-slate-50 px-1.5 py-1 text-right text-sm font-medium tabular-nums transition hover:border-slate-300 hover:bg-slate-100 focus:border-blue-400 focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-300 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none";
 
 interface TableRow {
   [key: string]: string | number;
@@ -103,28 +103,6 @@ const toBdiPercent = (value: unknown): number => {
   return toNumber(compact);
 };
 
-const applyLineSanity = (
-  qty: number,
-  unitPrice: number,
-  lineTotal: number,
-): { qty: number; unitPrice: number; lineTotal: number } => {
-  if (qty <= 0) {
-    return { qty, unitPrice, lineTotal };
-  }
-  if (unitPrice <= 0 && lineTotal > 0) {
-    return { qty, unitPrice: lineTotal / qty, lineTotal };
-  }
-  const expected = qty * unitPrice;
-  if (lineTotal <= 0) {
-    return { qty, unitPrice, lineTotal: expected };
-  }
-  const relErr = Math.abs(expected - lineTotal) / Math.max(Math.abs(expected), Math.abs(lineTotal), 1);
-  if (relErr > 0.02 && (expected > lineTotal * 2 || expected < lineTotal * 0.5)) {
-    return { qty, unitPrice: lineTotal / qty, lineTotal };
-  }
-  return { qty, unitPrice, lineTotal };
-};
-
 const mapStructuredItemsToValidation = (
   items: StructuredBudgetItem[],
 ): ItemOrcamento[] => {
@@ -139,10 +117,10 @@ const mapStructuredItemsToValidation = (
       continue;
     }
 
-    let qty = toNumber(item.quantidade ?? item.Quantidade);
-    let unitPrice = toNumber(item.valor_unitario ?? item["Valor Unitário"]);
-    let lineTotal = toNumber(item.valor_total ?? item.Total);
-    ({ qty, unitPrice, lineTotal } = applyLineSanity(qty, unitPrice, lineTotal));
+    const qty = toNumber(item.quantidade ?? item.Quantidade);
+    const bdi = toBdiPercent(item.bdi ?? item.BDI);
+    const unitComBdi = toNumber(item.valor_unitario ?? item["Valor Unitário"]);
+    const unitPrice = unitPriceSemBdiFromComBdi(unitComBdi, bdi);
 
     mapped.push({
       id: ++id,
@@ -151,12 +129,63 @@ const mapStructuredItemsToValidation = (
       banco: String(item.banco ?? ""),
       code: code || String(id).padStart(3, "0"),
       description,
-      bdi: toBdiPercent(item.bdi ?? item.BDI),
+      bdi,
       unit: String(item.unidade ?? item.Unidade ?? "un").trim() || "un",
       qty,
       unitPrice,
-      lineTotal,
+      lineTotal: 0,
       selected: false,
+    });
+  }
+
+  return mapped;
+};
+
+const mapStoredItemsToValidation = (rawItems: unknown[]): ItemOrcamento[] => {
+  const mapped: ItemOrcamento[] = [];
+  let id = 0;
+
+  for (const raw of rawItems) {
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    const tipo = String(item.tipo ?? "item").toLowerCase();
+    const description = String(item.descricao ?? item.description ?? "").trim();
+    if (tipo === "grupo" || description.toLowerCase().includes("total do grupo")) {
+      continue;
+    }
+
+    const qty = toNumber(item.quantidade ?? item.quantity ?? item.qty);
+    const bdi = toBdiPercent(item.bdi);
+    const unitFromStore =
+      item.unitPrice !== undefined
+        ? toNumber(item.unitPrice)
+        : unitPriceSemBdiFromComBdi(
+            toNumber(item.valor_unitario ?? item.unitValue),
+            bdi,
+          );
+
+    mapped.push({
+      id: ++id,
+      item: String(item.item ?? ""),
+      tipo: String(item.tipo ?? "item"),
+      banco: String(item.banco ?? ""),
+      code: String(item.codigo ?? item.code ?? id).trim() || String(id).padStart(3, "0"),
+      description,
+      bdi,
+      unit: String(item.unidade ?? item.unit ?? "un").trim() || "un",
+      qty,
+      unitPrice: unitFromStore,
+      lineTotal: 0,
+      selected: false,
+      classification: item.classification as "A" | "B" | "C" | undefined,
+      individual_percentage:
+        typeof item.individual_percentage === "number"
+          ? item.individual_percentage
+          : undefined,
+      accumulated_percentage:
+        typeof item.accumulated_percentage === "number"
+          ? item.accumulated_percentage
+          : undefined,
     });
   }
 
@@ -174,7 +203,6 @@ export default function ValidacaoOrcamento() {
 
   // States da Planilha
   const [items, setItems] = useState<ItemOrcamento[]>([]);
-  const [totalGeral, setTotalGeral] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string>("");
   const [isExporting, setIsExporting] = useState(false);
@@ -182,70 +210,9 @@ export default function ValidacaoOrcamento() {
   const [deleteItemId, setDeleteItemId] = useState<number | null>(null);
   const [selectAll, setSelectAll] = useState(false);
 
-  // --- LÓGICA DA CURVA ABC ---
-  const classifiedItems = useMemo(() => {
-    // Filtramos apenas linhas de serviço (ignorando grupos e totais)
-    const itemsToClassify = items.filter(
-      (item) =>
-        item.tipo !== "grupo" &&
-        !item.description.toLowerCase().includes("total do grupo"),
-    );
-    
-    // Ordenamos por valor total decrescente
-    const sortedItems = [...itemsToClassify].sort((a, b) => {
-      const totalA = a.lineTotal > 0 ? a.lineTotal : a.qty * a.unitPrice;
-      const totalB = b.lineTotal > 0 ? b.lineTotal : b.qty * b.unitPrice;
-      const diff = totalB - totalA;
-      if (diff !== 0) return diff;
-      return String(a.id).localeCompare(String(b.id), "pt-BR");
-    });
+  const abcResumo = useMemo(() => calcularResumoAbc(items), [items]);
 
-    const totalValue = sortedItems.reduce(
-      (acc, item) =>
-        acc + (item.lineTotal > 0 ? item.lineTotal : item.qty * item.unitPrice),
-      0,
-    );
-
-    let accumulatedValue = 0;
-    const classifiedMap = new Map<number, { classification: "A" | "B" | "C", accumulated_percentage: number }>();
-
-    sortedItems.forEach((item) => {
-      const itemTotal = item.lineTotal > 0 ? item.lineTotal : item.qty * item.unitPrice;
-      const prevPercentage = totalValue > 0 ? (accumulatedValue / totalValue) * 100 : 0;
-      accumulatedValue += itemTotal;
-      const currentPercentage = totalValue > 0 ? (accumulatedValue / totalValue) * 100 : 0;
-
-      let classification: "A" | "B" | "C" = "C";
-      if (prevPercentage < 80) {
-        classification = "A";
-      } else if (prevPercentage < 95) {
-        classification = "B";
-      }
-
-      classifiedMap.set(item.id, {
-        classification,
-        accumulated_percentage: currentPercentage,
-      });
-    });
-
-    // Construir a lista final ordenada: grupos primeiro (opcional, mas comum) ou apenas itens ordenados
-    // Como a instrução foi "deve ficar em ordem do mais caro ao mais barato", vamos retornar os itens ordenados
-    // e adicionar os grupos no final (ou ignorá-los na ordenação principal).
-    // Vamos separar grupos e itens classificados.
-    const finalItems: ItemOrcamento[] = [];
-
-    // Adiciona os itens ordenados e classificados
-    sortedItems.forEach(item => {
-      const abcData = classifiedMap.get(item.id);
-      finalItems.push({ ...item, ...abcData });
-    });
-
-    // Adiciona os grupos no final
-    const groups = items.filter(item => item.tipo === "grupo");
-    finalItems.push(...groups);
-
-    return finalItems;
-  }, [items]);
+  const applyAbcToItems = (raw: ItemOrcamento[]) => recalcularCurvaABC(raw);
 
   // States do PDF Viewer
   const [pdfFile, setPdfFile] = useState<File | null>(null);
@@ -267,46 +234,90 @@ export default function ValidacaoOrcamento() {
 
   const showSelectedTableImages = selectedTablePreviews.length > 0;
 
-  // 1. Recuperar o arquivo e dados extraídos ao carregar a tela
   useEffect(() => {
-    // Se veio arquivo da navegação, usamos ele
-    if (location.state?.file) {
-      setPdfFile(location.state.file);
-    } else {
-      // Em produção, evitar warning ruidoso ao abrir rota diretamente.
-      if (import.meta.env.DEV) {
-        console.warn("Nenhum arquivo encontrado no estado da rota");
-      }
-    }
-
-    // Carregar dados extraídos da API
-    const structuredItems = location.state?.structuredData?.items as
-      | StructuredBudgetItem[]
-      | undefined;
-
-    if (Array.isArray(structuredItems) && structuredItems.length > 0) {
-      setItems(mapStructuredItemsToValidation(structuredItems));
-      setIsLoading(false);
+    if (!uploadIdFromRoute && !location.state?.structuredData && !location.state?.extractedData) {
+      navigate("/validacao", { replace: true });
       return;
     }
 
-    if (location.state?.extractedData) {
-      const extractedData: ExtractedTable[] = location.state.extractedData;
+    const load = async () => {
+      setIsLoading(true);
+      setLoadError("");
+
+      if (location.state?.file) {
+        setPdfFile(location.state.file);
+      }
+
+      const structuredItems = location.state?.structuredData?.items as
+        | StructuredBudgetItem[]
+        | undefined;
+
+      if (Array.isArray(structuredItems) && structuredItems.length > 0) {
+        setItems(applyAbcToItems(mapStructuredItemsToValidation(structuredItems)));
+        setIsLoading(false);
+        return;
+      }
+
+      if (location.state?.extractedData) {
+        try {
+          const parsedItems = parseExtractedTables(
+            location.state.extractedData as ExtractedTable[],
+          );
+          setItems(applyAbcToItems(parsedItems));
+        } catch {
+          setLoadError("Erro ao processar dados extraídos do PDF");
+        }
+        setIsLoading(false);
+        return;
+      }
+
+      const uploadId = resolvedUploadId;
+      if (!uploadId) {
+        setLoadError("Orçamento não identificado.");
+        setIsLoading(false);
+        return;
+      }
 
       try {
-        const parsedItems = parseExtractedTables(extractedData);
-        setItems(parsedItems);
-        setIsLoading(false);
-      } catch (error) {
-        console.error("Erro ao processar dados extraídos:", error);
-        setLoadError("Erro ao processar dados extraídos do PDF");
+        const [firebaseDoc, backendDoc, pdfBlob] = await Promise.all([
+          getOrcamentoFromFirebase(uploadId).catch(() => null),
+          getOrcamento(uploadId).catch(() => null),
+          getOrcamentoPdf(uploadId).catch(() => null),
+        ]);
+
+        const rawItems =
+          (firebaseDoc?.items as unknown[]) ??
+          (backendDoc?.orcamento?.items as unknown[]) ??
+          (backendDoc?.items as unknown[]) ??
+          [];
+
+        if (!Array.isArray(rawItems) || rawItems.length === 0) {
+          setLoadError(
+            "Nenhum item salvo para este orçamento. Processe o PDF em Novo Orçamento.",
+          );
+          setIsLoading(false);
+          return;
+        }
+
+        setItems(applyAbcToItems(mapStoredItemsToValidation(rawItems)));
+
+        if (pdfBlob) {
+          setPdfFile(
+            new File([pdfBlob], firebaseDoc?.filename ?? `${uploadId}.pdf`, {
+              type: "application/pdf",
+            }),
+          );
+        }
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : "Erro ao carregar orçamento";
+        setLoadError(msg);
+      } finally {
         setIsLoading(false);
       }
-    } else {
-      setLoadError("Nenhum dado foi extraído do PDF");
-      setIsLoading(false);
-    }
-  }, [location, navigate]);
+    };
+
+    void load();
+  }, [location.state, uploadIdFromRoute, resolvedUploadId, navigate]);
 
   // Função para normalizar números (converte vírgula em ponto)
   const parseNumber = (value: any): number => {
@@ -451,22 +462,22 @@ export default function ValidacaoOrcamento() {
           const bdi = colBdi >= 0 ? toBdiPercent(row[colBdi]) : 0;
           const unit = String(row[colUn] || "un").trim();
           const qty = parseNumber(row[colQtd]);
-          const unitPrice = parseNumber(row[colVu]);
+          const unitComBdi = parseNumber(row[colVu]);
+          const unitPrice = unitPriceSemBdiFromComBdi(unitComBdi, bdi);
 
           // Validação: descrição não pode ser numérica simples (como "1.1", "2.1")
           const isNumeric =
             /^\d+(\.\d+)?$/.test(description) || description === "";
           if (description && !isNumeric) {
-            const sane = applyLineSanity(qty, unitPrice, qty * unitPrice);
             items.push({
               id: id++,
               code: `${id.toString().padStart(3, "0")}`,
               description,
               bdi,
               unit,
-              qty: sane.qty,
-              unitPrice: sane.unitPrice,
-              lineTotal: sane.lineTotal,
+              qty,
+              unitPrice,
+              lineTotal: 0,
             });
           }
         }
@@ -476,45 +487,46 @@ export default function ValidacaoOrcamento() {
     return items;
   };
 
-  // Recalcula total
-  useEffect(() => {
-    const total = items.reduce(
-      (acc, item) =>
-        acc + (item.lineTotal > 0 ? item.lineTotal : item.qty * item.unitPrice),
-      0,
-    );
-    setTotalGeral(total);
-  }, [items]);
+  const handleCellEdit = (
+    id: number,
+    field: "qty" | "unitPrice" | "bdi",
+    rawValue: string,
+  ) => {
+    const numericValue = parseEditableNumber(rawValue);
+    setItems((prev) => {
+      const updated = prev.map((item) =>
+        item.id === id ? { ...item, [field]: numericValue } : item,
+      );
+      return recalcularCurvaABC(updated);
+    });
+  };
 
-  // Handlers da Tabela
   const handleChange = (
     id: number,
     field: keyof ItemOrcamento,
     value: string | number,
   ) => {
-    setItems((prevItems) =>
-      prevItems.map((item) => {
-        if (item.id !== id) return item;
-        const updated = { ...item, [field]: value } as ItemOrcamento;
-        if (field === "qty" || field === "unitPrice") {
-          updated.lineTotal =
-            Number(updated.qty || 0) * Number(updated.unitPrice || 0);
-        }
-        return updated;
-      }),
-    );
+    setItems((prev) => {
+      const updated = prev.map((item) =>
+        item.id === id ? { ...item, [field]: value } : item,
+      );
+      if (field === "tipo") {
+        return recalcularCurvaABC(updated);
+      }
+      return updated;
+    });
   };
 
   const confirmRemoveItem = () => {
     if (deleteItemId == null) return;
-    setItems((prev) => prev.filter((item) => item.id !== deleteItemId));
+    setItems((prev) => recalcularCurvaABC(prev.filter((item) => item.id !== deleteItemId)));
     setDeleteItemId(null);
     toast.success("Item removido");
   };
 
   const handleAddItem = () => {
     const newItem: ItemOrcamento = {
-      id: Math.max(...items.map((i) => i.id), 0) + 1,
+      id: (items.length ? Math.max(...items.map((i) => i.id)) : 0) + 1,
       code: `${(items.length + 1).toString().padStart(3, "0")}`,
       description: "",
       bdi: 0,
@@ -524,19 +536,21 @@ export default function ValidacaoOrcamento() {
       lineTotal: 0,
       selected: false,
     };
-    setItems((prev) => [...prev, newItem]);
+    setItems((prev) => recalcularCurvaABC([...prev, newItem]));
   };
 
   const handleSelectAll = () => {
     const newSelectAll = !selectAll;
     setSelectAll(newSelectAll);
-    setItems(items.map(item => ({ ...item, selected: newSelectAll })));
+    setItems((prev) => prev.map((item) => ({ ...item, selected: newSelectAll })));
   };
 
   const handleSelectItem = (id: number) => {
-    setItems(items.map(item => 
-      item.id === id ? { ...item, selected: !item.selected } : item
-    ));
+    setItems((prev) =>
+      prev.map((item) =>
+        item.id === id ? { ...item, selected: !item.selected } : item,
+      ),
+    );
   };
 
   const selectedItemsCount = items.filter(item => item.selected).length;
@@ -555,7 +569,7 @@ export default function ValidacaoOrcamento() {
 
   // Handler de Exportação XLSX
   const handleExport = async () => {
-    if (classifiedItems.length === 0) {
+    if (items.length === 0) {
       toast.warning("Nada para exportar", {
         description: "Adicione pelo menos um item à planilha.",
       });
@@ -564,7 +578,7 @@ export default function ValidacaoOrcamento() {
 
     setIsExporting(true);
     try {
-      await exportToXLSX(classifiedItems);
+      await exportToXLSX(items);
       toast.success("Planilha exportada", {
         description: "O download do XLSX deve iniciar em instantes.",
       });
@@ -604,7 +618,7 @@ export default function ValidacaoOrcamento() {
 
       const extractedData = (location.state?.extractedData as ExtractedTable[] | undefined) || [];
 
-      const normalizedItems = classifiedItems.map((item) => ({
+      const normalizedItems = items.map((item) => ({
         id: String(item.id),
         item: item.item,
         tipo: item.tipo,
@@ -669,15 +683,15 @@ export default function ValidacaoOrcamento() {
         <div className="flex min-w-0 items-center gap-3">
           <button
             type="button"
-            onClick={() => navigate(-1)}
+            onClick={() => navigate("/validacao")}
             className={iconButton}
-            aria-label="Voltar"
+            aria-label="Voltar à lista de validação"
           >
             <ArrowLeft className="h-5 w-5" />
           </button>
           <div className="min-w-0">
             <h1 className="font-semibold leading-tight text-slate-900">
-              Orçamento extraído
+              Validação do orçamento
             </h1>
             <p className="flex items-center gap-1 text-xs text-slate-500">
               {isLoading
@@ -890,15 +904,63 @@ export default function ValidacaoOrcamento() {
                 + Adicionar Item
               </button>
             </div>
-            <div className="text-right">
-              <span className="text-xs text-slate-500 font-medium uppercase">
-                Total Geral
-              </span>
-              <p className="text-lg font-bold text-blue-700 tabular-nums transition-all duration-300">
-                R$ {formatMoney(totalGeral)}
+          </div>
+
+          {/* Mini dashboard Curva ABC */}
+          {!isLoading && !loadError && items.length > 0 && (
+            <div className="shrink-0 border-b border-slate-100 bg-slate-50/50 px-6 py-4">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+                <div className="rounded-xl border border-blue-200 bg-white p-4 shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Total geral (c/ BDI)
+                  </p>
+                  <p className="mt-2 text-xl font-bold tabular-nums text-blue-700 transition-all duration-300">
+                    R$ {formatMoney(abcResumo.totalGeral)}
+                  </p>
+                  <p className="mt-1 text-xs text-slate-400">
+                    {items.filter(isExecutiveItem).length} itens executivos
+                  </p>
+                </div>
+                <div className="rounded-xl border border-red-200 bg-red-50/40 p-4 shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-red-800">
+                    Classe A
+                  </p>
+                  <p className="mt-2 text-lg font-bold tabular-nums text-red-900 transition-all duration-300">
+                    {abcResumo.classeA.count} itens
+                  </p>
+                  <p className="mt-1 text-sm font-medium tabular-nums text-red-700">
+                    R$ {formatMoney(abcResumo.classeA.valor)}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-yellow-200 bg-yellow-50/50 p-4 shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-yellow-900">
+                    Classe B
+                  </p>
+                  <p className="mt-2 text-lg font-bold tabular-nums text-yellow-900 transition-all duration-300">
+                    {abcResumo.classeB.count} itens
+                  </p>
+                  <p className="mt-1 text-sm font-medium tabular-nums text-yellow-800">
+                    R$ {formatMoney(abcResumo.classeB.valor)}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50/40 p-4 shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-emerald-800">
+                    Classe C
+                  </p>
+                  <p className="mt-2 text-lg font-bold tabular-nums text-emerald-900 transition-all duration-300">
+                    {abcResumo.classeC.count} itens
+                  </p>
+                  <p className="mt-1 text-sm font-medium tabular-nums text-emerald-700">
+                    R$ {formatMoney(abcResumo.classeC.valor)}
+                  </p>
+                </div>
+              </div>
+              <p className="mt-3 text-xs text-slate-500">
+                Edite Quantidade, Valor Unitário (s/ BDI) ou BDI (%) na tabela — a Curva ABC
+                e os totais atualizam em tempo real.
               </p>
             </div>
-          </div>
+          )}
 
           {/* Estado: Carregando */}
           {isLoading && (
@@ -949,9 +1011,6 @@ export default function ValidacaoOrcamento() {
                           className="w-4 h-4 text-blue-600 rounded cursor-pointer"
                         />
                       </th>
-                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider w-20">
-                        Item
-                      </th>
                       <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider w-24">
                         Código
                       </th>
@@ -977,16 +1036,17 @@ export default function ValidacaoOrcamento() {
                         Qtd.
                       </th>
                       <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right w-28">
-                        Valor Unit.
+                        V. Unit. s/ BDI
                       </th>
                       <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right w-28 bg-slate-100">
-                        Total
+                        Total c/ BDI
                       </th>
                       <th className="px-2 py-3 w-8"></th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {classifiedItems.map((item) => {
+                    {items.map((item) => {
+                      const editable = isExecutiveItem(item);
                       // Determinar a cor de fundo com base na classificação ABC
                       let rowBgClass = "hover:bg-blue-50/30";
                       if (item.classification === "A") {
@@ -1010,25 +1070,6 @@ export default function ValidacaoOrcamento() {
                             checked={item.selected || false}
                             onChange={() => handleSelectItem(item.id)}
                             className="w-4 h-4 text-blue-600 rounded cursor-pointer"
-                          />
-                        </td>
-                        <td className="px-4 py-3">
-                          <input
-                            type="text"
-                            value={item.item || ""}
-                            onChange={(e) =>
-                              handleChange(item.id, "item", e.target.value)
-                            }
-                            className={`w-full bg-transparent font-mono text-xs focus:outline-none border-b border-transparent focus:border-blue-500 ${
-                              item.classification === "A"
-                                ? "text-red-700"
-                                : item.classification === "B"
-                                  ? "text-yellow-700"
-                                  : item.classification === "C"
-                                    ? "text-emerald-700"
-                                    : "text-slate-600"
-                            }`}
-                            placeholder="1.1"
                           />
                         </td>
                         <td className="px-4 py-3">
@@ -1099,7 +1140,7 @@ export default function ValidacaoOrcamento() {
                                     ? "bg-yellow-100 text-yellow-700"
                                     : "bg-emerald-100 text-emerald-700"
                               }`}
-                              title={`Acumulado: ${item.accumulated_percentage?.toFixed(2)}%`}
+                              title={`${item.individual_percentage?.toFixed(2) ?? "0"}% do total · Acumulado: ${item.accumulated_percentage?.toFixed(2) ?? "0"}%`}
                             >
                               {item.classification}
                             </span>
@@ -1130,31 +1171,23 @@ export default function ValidacaoOrcamento() {
                           />
                         </td>
                         <td className="px-3 py-3">
-                          <input
-                            type="number"
-                            step="0.01"
-                            min={0}
-                            inputMode="decimal"
-                            value={item.bdi}
-                            onChange={(e) =>
-                              handleChange(
-                                item.id,
-                                "bdi",
-                                parseFloat(e.target.value) || 0,
-                              )
-                            }
-                            className={`w-full text-right bg-transparent text-sm font-medium focus:outline-none border-b border-transparent focus:border-blue-500 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none ${
-                              item.classification === "A"
-                                ? "text-red-900"
-                                : item.classification === "B"
-                                  ? "text-yellow-900"
-                                  : item.classification === "C"
-                                    ? "text-emerald-900"
-                                    : "text-slate-700"
-                            }`}
-                            placeholder="0,00"
-                            aria-label={`BDI percentual do item ${item.code}`}
-                          />
+                          {editable ? (
+                            <input
+                              type="number"
+                              step="0.01"
+                              min={0}
+                              inputMode="decimal"
+                              value={item.bdi}
+                              onChange={(e) =>
+                                handleCellEdit(item.id, "bdi", e.target.value)
+                              }
+                              className={EDITABLE_NUMERIC_CLASS}
+                              placeholder="0,00"
+                              aria-label={`BDI percentual do item ${item.code}`}
+                            />
+                          ) : (
+                            <span className="block text-right text-sm text-slate-400">—</span>
+                          )}
                         </td>
                         <td className="px-2 py-3 text-center">
                           <input
@@ -1175,63 +1208,44 @@ export default function ValidacaoOrcamento() {
                           />
                         </td>
                         <td className="px-4 py-3">
-                          <input
-                            type="number"
-                            step="any"
-                            inputMode="decimal"
-                            value={item.qty}
-                            onChange={(e) =>
-                              handleChange(
-                                item.id,
-                                "qty",
-                                parseFloat(e.target.value) || 0,
-                              )
-                            }
-                            placeholder="0,00"
-                            className={`w-full text-right bg-transparent text-sm font-medium focus:outline-none border-b border-transparent focus:border-blue-500 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none ${
-                              item.classification === "A"
-                                ? "text-red-900"
-                                : item.classification === "B"
-                                  ? "text-yellow-900"
-                                  : item.classification === "C"
-                                    ? "text-emerald-900"
-                                    : "text-slate-700"
-                            }`}
-                          />
-                        </td>
-                        <td className="px-4 py-3">
-                          <div className="flex items-center justify-end gap-1 border-b border-transparent focus-within:border-blue-500 transition-colors">
-                            <span className={`text-xs ${
-                              item.classification === "A"
-                                ? "text-red-400"
-                                : item.classification === "B"
-                                  ? "text-yellow-500"
-                                  : item.classification === "C"
-                                    ? "text-emerald-500"
-                                    : "text-slate-400"
-                            }`}>R$</span>
+                          {editable ? (
                             <input
                               type="number"
-                              step="0.01"
-                              value={item.unitPrice}
+                              step="any"
+                              min={0}
+                              inputMode="decimal"
+                              value={item.qty}
                               onChange={(e) =>
-                                handleChange(
-                                  item.id,
-                                  "unitPrice",
-                                  parseFloat(e.target.value) || 0,
-                                )
+                                handleCellEdit(item.id, "qty", e.target.value)
                               }
-                              className={`w-20 text-right bg-transparent text-sm font-medium focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none ${
-                                item.classification === "A"
-                                  ? "text-red-900"
-                                  : item.classification === "B"
-                                    ? "text-yellow-900"
-                                    : item.classification === "C"
-                                      ? "text-emerald-900"
-                                      : "text-slate-700"
-                              }`}
+                              placeholder="0"
+                              className={EDITABLE_NUMERIC_CLASS}
+                              aria-label={`Quantidade do item ${item.code}`}
                             />
-                          </div>
+                          ) : (
+                            <span className="block text-right text-sm text-slate-400">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          {editable ? (
+                            <div className="flex items-center justify-end gap-1">
+                              <span className="text-xs text-slate-400">R$</span>
+                              <input
+                                type="number"
+                                step="0.01"
+                                min={0}
+                                inputMode="decimal"
+                                value={item.unitPrice}
+                                onChange={(e) =>
+                                  handleCellEdit(item.id, "unitPrice", e.target.value)
+                                }
+                                className={`${EDITABLE_NUMERIC_CLASS} w-24`}
+                                aria-label={`Valor unitário s/ BDI do item ${item.code}`}
+                              />
+                            </div>
+                          ) : (
+                            <span className="block text-right text-sm text-slate-400">—</span>
+                          )}
                         </td>
                         <td className={`px-4 py-3 text-right ${
                           item.classification === "A"
@@ -1251,11 +1265,7 @@ export default function ValidacaoOrcamento() {
                                   ? "text-emerald-900"
                                   : "text-slate-800"
                           }`}>
-                            {formatMoney(
-                              item.lineTotal > 0
-                                ? item.lineTotal
-                                : item.qty * item.unitPrice,
-                            )}
+                            {formatMoney(item.lineTotal)}
                           </span>
                         </td>
                         <td className="px-2 py-3 text-center">

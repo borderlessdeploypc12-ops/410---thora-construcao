@@ -1864,6 +1864,612 @@ async def get_ai_analysis(upload_id: str):
         "analyzed_at": ai_analysis.get("analyzed_at"),
     }
 
+def _is_executive_budget_item(item: Dict[str, Any]) -> bool:
+    tipo = str(item.get("tipo") or "item").lower()
+    desc = str(item.get("descricao") or item.get("description") or "").lower()
+    return tipo != "grupo" and "total do grupo" not in desc
+
+
+def _item_line_total(item: Dict[str, Any]) -> float:
+    explicit = _coerce_number(item.get("lineTotal") or item.get("line_total") or 0)
+    if explicit > 0:
+        return explicit
+    total = _coerce_number(
+        item.get("valor_total") or item.get("totalValue") or item.get("lineTotal") or 0
+    )
+    if total > 0:
+        return total
+    qty = _coerce_number(
+        item.get("quantidade") or item.get("quantity") or item.get("qty") or 0
+    )
+    unit = _coerce_number(
+        item.get("valor_unitario")
+        or item.get("unitValue")
+        or item.get("unitPrice")
+        or 0
+    )
+    bdi = _coerce_bdi(item.get("bdi"))
+    return qty * unit * (1 + bdi / 100.0)
+
+
+def _enrich_items_with_abc(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Recalcula totais e classificação A/B/C (Pareto) quando ausentes no Firestore."""
+    enriched: List[Dict[str, Any]] = [dict(item) for item in items]
+    executives = [item for item in enriched if _is_executive_budget_item(item)]
+
+    for item in executives:
+        item["lineTotal"] = _item_line_total(item)
+
+    executives.sort(
+        key=lambda row: (_item_line_total(row), str(row.get("codigo") or row.get("code") or "")),
+        reverse=True,
+    )
+    total_value = sum(_item_line_total(row) for row in executives)
+    accumulated = 0.0
+
+    for item in executives:
+        line_total = _item_line_total(item)
+        prev_pct = (accumulated / total_value * 100.0) if total_value else 0.0
+        accumulated += line_total
+        if prev_pct < 80:
+            item["classification"] = "A"
+        elif prev_pct < 95:
+            item["classification"] = "B"
+        else:
+            item["classification"] = "C"
+        item["individual_percentage"] = (
+            (line_total / total_value * 100.0) if total_value else 0.0
+        )
+        item["accumulated_percentage"] = (
+            (accumulated / total_value * 100.0) if total_value else 0.0
+        )
+
+    return enriched
+
+
+def _detect_abc_class_filter(message: str) -> str | None:
+    msg = message.lower()
+    for cls in ("a", "b", "c"):
+        if re.search(
+            rf"(?:curva|classe|classifica[cç][aã]o|class)\s+{cls}\b|"
+            rf"\bcurva\s+{cls}\b",
+            msg,
+        ):
+            return cls.upper()
+    return None
+
+
+def _filter_items_for_message(
+    items: List[Dict[str, Any]], message: str
+) -> Tuple[List[Dict[str, Any]], str | None]:
+    abc_cls = _detect_abc_class_filter(message)
+    if not abc_cls:
+        return items, None
+
+    filtered = [
+        item
+        for item in items
+        if _is_executive_budget_item(item)
+        and str(item.get("classification") or "").upper() == abc_cls
+    ]
+    return filtered, abc_cls
+
+
+def _infer_chart_value_label(message: str) -> str:
+    msg = message.lower()
+    if any(k in msg for k in ("quantidade", "qtd", "volume", "qtde")):
+        return "quantidade"
+    if any(k in msg for k in ("percentual", "percent", "porcentagem", "%")):
+        return "percentual"
+    return "valor"
+
+
+def _rebuild_chart_from_items(
+    items: List[Dict[str, Any]],
+    title: str,
+    *,
+    chart_type: str = "horizontal_bar",
+    value_label: str = "valor",
+    limit: int = 15,
+) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
+    for item in items:
+        if not _is_executive_budget_item(item):
+            continue
+        desc = str(item.get("descricao") or item.get("description") or "Item").strip()
+        code = str(item.get("codigo") or item.get("code") or "").strip()
+        label = f"{code} — {desc}" if code else desc
+        if value_label == "quantidade":
+            metric = _coerce_number(
+                item.get("quantidade") or item.get("quantity") or item.get("qty") or 0
+            )
+        elif value_label == "percentual":
+            metric = _coerce_number(
+                item.get("individual_percentage")
+                or item.get("percentual")
+                or 0
+            )
+        else:
+            metric = _item_line_total(item)
+
+        if metric <= 0:
+            continue
+        rows.append({"name": label[:55], "value": float(metric)})
+
+    rows.sort(key=lambda row: row["value"], reverse=True)
+    top = rows[:limit]
+
+    return {
+        "title": title,
+        "chart_type": chart_type,
+        "value_label": value_label,
+        "data": top or [{"name": "Sem dados", "value": 0}],
+    }
+
+
+def _sanitize_ai_chart(
+    chart: Dict[str, Any] | None,
+    source_items: List[Dict[str, Any]],
+    message: str,
+    *,
+    default_title: str = "Gráfico do orçamento",
+) -> Dict[str, Any] | None:
+    if not source_items:
+        return chart
+
+    value_label = _infer_chart_value_label(message)
+    executives = [i for i in source_items if _is_executive_budget_item(i)]
+    if not executives:
+        return chart
+
+    max_source = max(
+        (
+            _coerce_number(
+                i.get("quantidade") if value_label == "quantidade" else _item_line_total(i)
+            )
+            for i in executives
+        ),
+        default=0,
+    )
+
+    if not chart or not isinstance(chart.get("data"), list):
+        if any(k in message.lower() for k in ("gráfico", "grafico", "chart", "barras", "pizza")):
+            return _rebuild_chart_from_items(
+                source_items,
+                default_title,
+                value_label=value_label,
+            )
+        return chart
+
+    data = chart.get("data") or []
+    max_chart = max(
+        (_coerce_number(row.get("value") or row.get("valor") or 0) for row in data if isinstance(row, dict)),
+        default=0,
+    )
+    chart_label = str(chart.get("value_label") or "valor").lower()
+
+    wrong_percent_axis = chart_label == "percentual" and value_label == "valor"
+    wrong_tiny_values = (
+        value_label == "valor"
+        and max_chart > 0
+        and max_chart < 1000
+        and max_source > 10_000
+    )
+    empty_or_zero = max_chart <= 0 and max_source > 0
+    suspicious_count_scale = (
+        value_label == "valor"
+        and max_chart <= 100
+        and max_source > 50_000
+        and len(data) > 0
+    )
+
+    if wrong_percent_axis or wrong_tiny_values or empty_or_zero or suspicious_count_scale:
+        return _rebuild_chart_from_items(
+            source_items,
+            str(chart.get("title") or default_title),
+            chart_type=str(chart.get("chart_type") or "horizontal_bar"),
+            value_label=value_label,
+        )
+
+    normalized = []
+    for row in data[:15]:
+        if not isinstance(row, dict):
+            continue
+        normalized.append(
+            {
+                "name": str(row.get("name") or row.get("label") or "—")[:55],
+                "value": _coerce_number(row.get("value") or row.get("valor") or 0),
+            }
+        )
+    if not normalized:
+        return _rebuild_chart_from_items(
+            source_items, str(chart.get("title") or default_title), value_label=value_label
+        )
+
+    chart["data"] = normalized
+    chart["value_label"] = value_label
+    if not chart.get("chart_type"):
+        chart["chart_type"] = "horizontal_bar"
+    return chart
+
+
+class AiReportChatRequest(BaseModel):
+    message: str = Field(..., min_length=3, max_length=2000)
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+    filename: str = Field(default="orcamento")
+    upload_id: str = Field(default="")
+
+
+def _encode_attachment(filename: str, mime_type: str, text_content: str) -> Dict[str, str]:
+    return {
+        "filename": filename,
+        "mime_type": mime_type,
+        "content_base64": base64.b64encode(text_content.encode("utf-8")).decode("ascii"),
+    }
+
+
+def _build_report_attachments(
+    reply: str,
+    table: Dict[str, Any] | None,
+    chart: Dict[str, Any] | None,
+    upload_label: str,
+) -> List[Dict[str, str]]:
+    attachments: List[Dict[str, str]] = []
+    safe_label = re.sub(r"[^\w\-]+", "_", upload_label)[:40] or "orcamento"
+
+    if reply and len(reply.strip()) > 80:
+        md = f"# Análise — {upload_label}\n\n{reply.strip()}\n"
+        attachments.append(
+            _encode_attachment(f"analise_{safe_label}.md", "text/markdown", md)
+        )
+
+    if table and isinstance(table.get("rows"), list):
+        headers = table.get("headers") or []
+        rows = table.get("rows") or []
+        lines = []
+        if headers:
+            lines.append(";".join(str(h) for h in headers))
+        for row in rows[:500]:
+            if isinstance(row, list):
+                lines.append(";".join(str(c) for c in row))
+        if lines:
+            attachments.append(
+                _encode_attachment(
+                    f"tabela_{safe_label}.csv",
+                    "text/csv",
+                    "\n".join(lines),
+                )
+            )
+
+    if chart and isinstance(chart.get("data"), list):
+        chart_lines = ["item;valor"]
+        for point in chart["data"][:50]:
+            if isinstance(point, dict):
+                chart_lines.append(
+                    f"{point.get('name', '')};{point.get('value', 0)}"
+                )
+        attachments.append(
+            _encode_attachment(
+                f"grafico_{safe_label}.csv",
+                "text/csv",
+                "\n".join(chart_lines),
+            )
+        )
+
+    return attachments
+
+
+def _local_report_response(
+    message: str,
+    items: List[Dict[str, Any]],
+    *,
+    abc_filter: str | None = None,
+) -> Dict[str, Any]:
+    """Fallback local quando IA indisponível."""
+    msg_lower = message.lower()
+    value_label = _infer_chart_value_label(message)
+    use_value = value_label == "valor"
+
+    rows_data = []
+    for item in items[:200]:
+        desc = str(item.get("descricao") or item.get("description") or "Item")[:60]
+        qty = _coerce_number(
+            item.get("quantidade") or item.get("quantity") or item.get("qty") or 0
+        )
+        val = _item_line_total(item)
+        if value_label == "percentual":
+            metric = _coerce_number(item.get("individual_percentage") or 0)
+        elif use_value:
+            metric = val
+        else:
+            metric = qty
+        if metric <= 0:
+            continue
+        rows_data.append(
+            {
+                "descricao": desc,
+                "quantidade": qty,
+                "valor_total": val,
+                "metric": metric,
+            }
+        )
+
+    rows_data.sort(key=lambda r: r["metric"], reverse=True)
+    top = rows_data[:10]
+
+    metric_label = (
+        "valor total (R$)"
+        if value_label == "valor"
+        else "percentual (%)"
+        if value_label == "percentual"
+        else "quantidade"
+    )
+    chart_title = (
+        f"Itens da Curva {abc_filter} do Orçamento"
+        if abc_filter
+        else f"Itens por {metric_label}"
+    )
+    chart_data = [
+        {"name": r["descricao"][:40], "value": float(r["metric"])} for r in top
+    ]
+
+    lines = [
+        "## Resposta (análise local)\n",
+        f"Pedido: *{message[:200]}*\n",
+    ]
+    if abc_filter:
+        lines.append(
+            f"Filtro aplicado: **Curva {abc_filter}** ({len(items)} itens nesta classe).\n"
+        )
+    lines.append(f"Top **{len(top)}** itens por **{metric_label}**:\n")
+    for i, r in enumerate(top, 1):
+        lines.append(
+            f"{i}. **{r['descricao']}** — qtd: {r['quantidade']:,.2f}, "
+            f"valor: R$ {r['valor_total']:,.2f}"
+        )
+
+    reply = "\n".join(lines)
+    table = {
+        "title": f"Top itens por {metric_label}",
+        "headers": ["#", "Descrição", "Quantidade", "Valor total (R$)"],
+        "rows": [
+            [i, r["descricao"], r["quantidade"], r["valor_total"]]
+            for i, r in enumerate(top, 1)
+        ],
+    }
+    chart = {
+        "title": chart_title,
+        "chart_type": "horizontal_bar",
+        "value_label": value_label,
+        "data": chart_data or [{"name": "Sem dados", "value": 0}],
+    }
+
+    wants_chart = any(
+        k in msg_lower for k in ("gráfico", "grafico", "chart", "pizza", "barras")
+    )
+
+    return {
+        "reply": reply,
+        "response_type": "mixed" if wants_chart else "text",
+        "chart": chart if wants_chart else None,
+        "table": table,
+    }
+
+
+@app.post("/api/ai-report-chat")
+async def ai_report_chat(
+    payload: AiReportChatRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Assistente de análise sobre orçamento (texto, tabelas, gráficos opcionais).
+    Retorna resposta para o chat e anexos para download (CSV/Markdown).
+    """
+    items = payload.items or []
+    if not items:
+        raise HTTPException(status_code=400, detail="Nenhum item enviado para análise")
+
+    enriched_items = _enrich_items_with_abc(items)
+    working_items, abc_filter = _filter_items_for_message(enriched_items, payload.message)
+    if abc_filter and not working_items:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Nenhum item encontrado na Curva {abc_filter}. "
+                "Valide o orçamento na aba Validação para recalcular a classificação ABC."
+            ),
+        )
+
+    compact_items = []
+    for idx, item in enumerate(working_items[:250]):
+        compact_items.append(
+            {
+                "i": idx + 1,
+                "codigo": str(item.get("codigo") or item.get("code") or "")[:20],
+                "descricao": str(item.get("descricao") or item.get("description") or "")[:120],
+                "quantidade": _coerce_number(
+                    item.get("quantidade") or item.get("quantity") or item.get("qty")
+                ),
+                "unidade": str(item.get("unidade") or item.get("unit") or "un")[:10],
+                "valor_unitario": _coerce_number(
+                    item.get("valor_unitario") or item.get("unitValue") or item.get("unitPrice")
+                ),
+                "valor_total": _coerce_number(
+                    item.get("valor_total") or item.get("totalValue") or item.get("lineTotal")
+                ),
+                "bdi": _coerce_bdi(item.get("bdi")),
+                "classificacao": str(item.get("classification") or "").upper()[:1],
+                "percentual_individual": _coerce_number(item.get("individual_percentage") or 0),
+                "valor_total_calculado": _item_line_total(item),
+            }
+        )
+
+    abc_hint = ""
+    if abc_filter:
+        abc_hint = (
+            f"\n- O usuário pediu APENAS itens da Curva {abc_filter}. "
+            f"Todos os itens enviados já pertencem à classe {abc_filter}."
+        )
+
+    system_message = (
+        """Você é especialista em orçamentos de construção civil no Brasil.
+O usuário faz perguntas sobre UM orçamento extraído de PDF (itens fornecidos).
+Responda APENAS com JSON válido (sem markdown fora do campo reply):
+{
+  "reply": "resposta completa em markdown em português (pode ser longa, com listas e tabelas)",
+  "response_type": "text" | "chart" | "table" | "mixed",
+  "chart": null OU {
+    "title": "título",
+    "chart_type": "bar" | "pie" | "line" | "horizontal_bar",
+    "value_label": "quantidade" | "valor" | "percentual",
+    "data": [{"name": "rótulo", "value": número}]
+  },
+  "table": null OU {
+    "title": "título",
+    "headers": ["col1", "col2"],
+    "rows": [["a", 1], ["b", 2]]
+  }
+}
+Regras OBRIGATÓRIAS:
+- Use SOMENTE os itens fornecidos; não invente serviços ou valores
+- Se o pedido for texto/relatório/comparação/resumo: response_type text ou table, chart null
+- Se pedir gráfico: inclua chart com até 15 pontos; value_label coerente com o eixo
+- Para barras com descrições longas de itens, prefira chart_type "horizontal_bar" (legível)
+- Se pedir relatório detalhado: reply longo + table preenchida
+- Não responda sobre assuntos fora do orçamento/PDF
+- CRÍTICO: quando value_label for "valor", use valor_total_calculado em reais (ex: 150000.50), NUNCA percentual acumulado (0-100)
+- CRÍTICO: "percentual" só quando o usuário pedir percentual/% explicitamente"""
+        + abc_hint
+    )
+
+    user_message = {
+        "pedido_usuario": payload.message,
+        "arquivo": payload.filename,
+        "total_itens": len(compact_items),
+        "itens": compact_items,
+    }
+
+    content = None
+    provider_used = "local:fallback"
+    errors: List[str] = []
+    parsed: Dict[str, Any] | None = None
+
+    if OPENAI_API_KEY:
+        try:
+            content, provider_used = await _call_openai_compatible_generate_content(
+                provider="openai",
+                base_url="https://api.openai.com/v1",
+                api_key=OPENAI_API_KEY,
+                model=OPENAI_MODEL,
+                system_message=system_message,
+                user_message=user_message,
+                timeout_seconds=AI_PROVIDER_TIMEOUT_SECONDS,
+            )
+        except AIProviderError as exc:
+            errors.append(f"{exc.provider}: {exc.details}")
+
+    if content:
+        try:
+            parsed = json.loads(_clean_json_text(content))
+        except json.JSONDecodeError:
+            errors.append("parser: JSON inválido da IA")
+            parsed = None
+
+    if not parsed:
+        parsed = _local_report_response(
+            payload.message, working_items, abc_filter=abc_filter
+        )
+        provider_used = "local:fallback"
+
+    reply = str(parsed.get("reply") or "").strip()
+    if not reply:
+        reply = "Não foi possível gerar uma análise para este pedido."
+
+    chart_raw = parsed.get("chart")
+    chart: Dict[str, Any] | None = None
+    if isinstance(chart_raw, dict) and chart_raw.get("data"):
+        normalized_data = []
+        for row in (chart_raw.get("data") or [])[:15]:
+            if not isinstance(row, dict):
+                continue
+            normalized_data.append(
+                {
+                    "name": str(row.get("name") or row.get("label") or "—")[:50],
+                    "value": _coerce_number(row.get("value") or row.get("valor") or 0),
+                }
+            )
+        if normalized_data:
+            chart = {
+                "title": str(chart_raw.get("title") or "Gráfico"),
+                "chart_type": str(chart_raw.get("chart_type") or "bar"),
+                "value_label": str(chart_raw.get("value_label") or "valor"),
+                "data": normalized_data,
+            }
+
+    chart_title_default = (
+        f"Itens da Curva {abc_filter} do Orçamento"
+        if abc_filter
+        else "Gráfico do orçamento"
+    )
+    chart = _sanitize_ai_chart(
+        chart,
+        working_items,
+        payload.message,
+        default_title=chart_title_default,
+    )
+
+    table_raw = parsed.get("table")
+    table: Dict[str, Any] | None = None
+    if isinstance(table_raw, dict) and table_raw.get("rows"):
+        table = {
+            "title": str(table_raw.get("title") or "Tabela"),
+            "headers": table_raw.get("headers") or [],
+            "rows": table_raw.get("rows") or [],
+        }
+
+    upload_label = payload.filename or payload.upload_id or "orcamento"
+    attachments = _build_report_attachments(reply, table, chart, upload_label)
+
+    return {
+        "status": "success",
+        "provider": provider_used,
+        "warnings": errors,
+        "reply": reply,
+        "response_type": str(parsed.get("response_type") or "text"),
+        "chart": chart,
+        "table": table,
+        "attachments": attachments,
+    }
+
+
+@app.get("/api/orcamentos/{upload_id}/pdf")
+async def get_orcamento_pdf(
+    upload_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Retorna o PDF original do upload, se ainda existir no servidor."""
+    file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
+    if not file_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="PDF não encontrado no servidor. Reenvie o arquivo se necessário.",
+        )
+    meta_path = _meta_path_for_upload_id(upload_id)
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            owner = meta.get("userId")
+            if owner and str(owner) != str(user_id):
+                raise HTTPException(status_code=403, detail="Acesso negado")
+        except json.JSONDecodeError:
+            pass
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/pdf",
+        filename=f"{upload_id}.pdf",
+    )
+
+
 # ============== FIRESTORE OPERATIONS ==============
 
 @app.get("/api/orcamentos")

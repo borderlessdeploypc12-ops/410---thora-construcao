@@ -4,7 +4,6 @@ import {
   Home,
   FileText,
   BarChart3,
-  TrendingUp,
   Menu,
   X,
   LogOut,
@@ -36,7 +35,6 @@ const SidebarLayout: React.FC<SidebarLayoutProps> = ({ children }) => {
     { path: "/orcamento", label: "Novo Orçamento", icon: Upload },
     { path: "/validacao", label: "Validação", icon: ClipboardCheck },
     { path: "/relatorios", label: "Relatórios", icon: BarChart3 },
-    { path: "/analytics", label: "BI & Analytics", icon: TrendingUp },
   ];
 
   const asideWidth = sidebarOpen ? "w-64" : "w-20";
