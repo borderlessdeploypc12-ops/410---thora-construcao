@@ -8,7 +8,7 @@ import {
   Plus,
 } from "lucide-react";
 import { toast } from "sonner";
-import { exportToXLSX, getOrcamento, getOrcamentoFromFirebase } from "../services/api";
+import { getOrcamento, getOrcamentoFromFirebase } from "../services/api";
 import {
   OrcamentoPdfWizard,
   type OrcamentoWizardResult,
@@ -20,7 +20,6 @@ import {
 } from "../features/orcamentos/novoOrcamentoWizard";
 import {
   calcularResumoAnalitico,
-  linhasToExportPayload,
   mapRawListToLinhasAnaliticas,
   type LinhaAnalitica,
 } from "../features/orcamentos/orcamentoAnalitico";
@@ -30,7 +29,8 @@ import {
   type AnaliticoEditableField,
 } from "../features/orcamentos/recalcularAnaliticoHierarquico";
 import type { NovoOrcamentoFlowState } from "../features/orcamentos/outputModels";
-import { ANALITICO_ONLY } from "../features/orcamentos/outputModels";
+import { ANALITICO_ONLY, FULL_ORCAMENTO_EXPORT } from "../features/orcamentos/outputModels";
+import { exportOrcamentoExcel } from "../features/orcamentos/exportOrcamento";
 import { useOrcamentoLinhasContext } from "../features/orcamentos/OrcamentoLinhasContext";
 import { btnAccent, btnMuted } from "../components/ui/buttonClasses";
 
@@ -61,6 +61,7 @@ const OrcamentoAnalitico: React.FC = () => {
   const [linhas, setLinhas] = useState<LinhaAnalitica[]>([]);
   const [currentUploadId, setCurrentUploadId] = useState<string | null>(uploadIdParam ?? null);
   const [isExporting, setIsExporting] = useState(false);
+  const [isExportingFull, setIsExportingFull] = useState(false);
   const [nomeProjeto, setNomeProjeto] = useState<string>(
     flowState?.nomeProjeto ?? "Orçamento",
   );
@@ -216,16 +217,39 @@ const OrcamentoAnalitico: React.FC = () => {
 
     setIsExporting(true);
     try {
-      await exportToXLSX(linhasToExportPayload(linhas), {
+      await exportOrcamentoExcel({
+        linhas,
         modelosSelecionados: ANALITICO_ONLY,
         nomeProjeto,
       });
-      toast.success("Excel exportado");
+      toast.success("Excel analítico exportado");
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Erro ao exportar";
       toast.error("Falha na exportação", { description: msg });
     } finally {
       setIsExporting(false);
+    }
+  };
+
+  const handleExportFull = async () => {
+    if (linhas.length === 0) {
+      toast.warning("Nada para exportar");
+      return;
+    }
+
+    setIsExportingFull(true);
+    try {
+      await exportOrcamentoExcel({
+        linhas,
+        modelosSelecionados: FULL_ORCAMENTO_EXPORT,
+        nomeProjeto,
+      });
+      toast.success("Pacote completo exportado (Analítico + Sintético + ABC)");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Erro ao exportar";
+      toast.error("Falha na exportação", { description: msg });
+    } finally {
+      setIsExportingFull(false);
     }
   };
 
@@ -282,6 +306,20 @@ const OrcamentoAnalitico: React.FC = () => {
             <button type="button" onClick={handleNovaAnalise} className={btnMuted}>
               <Plus className="h-4 w-4" />
               Nova análise
+            </button>
+            <button
+              type="button"
+              disabled={linhas.length === 0 || isExportingFull}
+              onClick={() => void handleExportFull()}
+              className={btnMuted}
+              title="Analítico + Sintético + Curva ABC"
+            >
+              {isExportingFull ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <FileSpreadsheet className="h-4 w-4" />
+              )}
+              {isExportingFull ? "Exportando…" : "Pacote completo"}
             </button>
             <button
               type="button"

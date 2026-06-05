@@ -2,14 +2,13 @@ import React, { useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Download, FileSpreadsheet, LayoutList, Loader2 } from "lucide-react";
 import { toast } from "sonner";
-import { exportToXLSX } from "../services/api";
 import {
-  calcularResumoSintetico,
   filtrarLinhasSintetico,
-  linhasSinteticoToExportPayload,
+  calcularResumoSintetico,
 } from "../features/orcamentos/orcamentoSintetico";
 import { useOrcamentoLinhasLoader } from "../features/orcamentos/useOrcamentoLinhasLoader";
-import { SINTETICO_ONLY } from "../features/orcamentos/outputModels";
+import { exportOrcamentoExcel } from "../features/orcamentos/exportOrcamento";
+import { SINTETICO_ONLY, FULL_ORCAMENTO_EXPORT } from "../features/orcamentos/outputModels";
 import { btnAccent, btnMuted } from "../components/ui/buttonClasses";
 
 const formatMoney = (value: number) =>
@@ -19,6 +18,7 @@ const OrcamentoSintetico: React.FC = () => {
   const navigate = useNavigate();
   const { status, linhas, uploadId, nomeProjeto } = useOrcamentoLinhasLoader();
   const [isExporting, setIsExporting] = useState(false);
+  const [isExportingFull, setIsExportingFull] = useState(false);
 
   const linhasSintetico = useMemo(() => filtrarLinhasSintetico(linhas), [linhas]);
   const resumo = useMemo(() => calcularResumoSintetico(linhasSintetico), [linhasSintetico]);
@@ -31,7 +31,8 @@ const OrcamentoSintetico: React.FC = () => {
 
     setIsExporting(true);
     try {
-      await exportToXLSX(linhasSinteticoToExportPayload(linhas), {
+      await exportOrcamentoExcel({
+        linhas,
         modelosSelecionados: SINTETICO_ONLY,
         nomeProjeto,
       });
@@ -41,6 +42,28 @@ const OrcamentoSintetico: React.FC = () => {
       toast.error("Falha na exportação", { description: msg });
     } finally {
       setIsExporting(false);
+    }
+  };
+
+  const handleExportFull = async () => {
+    if (linhas.length === 0) {
+      toast.warning("Nada para exportar");
+      return;
+    }
+
+    setIsExportingFull(true);
+    try {
+      await exportOrcamentoExcel({
+        linhas,
+        modelosSelecionados: FULL_ORCAMENTO_EXPORT,
+        nomeProjeto,
+      });
+      toast.success("Pacote completo exportado (Analítico + Sintético + ABC)");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Erro ao exportar";
+      toast.error("Falha na exportação", { description: msg });
+    } finally {
+      setIsExportingFull(false);
     }
   };
 
@@ -87,6 +110,20 @@ const OrcamentoSintetico: React.FC = () => {
               Ver Analítico
             </button>
           )}
+          <button
+            type="button"
+            className={btnMuted}
+            disabled={isExportingFull}
+            onClick={() => void handleExportFull()}
+            title="Analítico + Sintético + Curva ABC"
+          >
+            {isExportingFull ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <FileSpreadsheet className="mr-2 h-4 w-4" />
+            )}
+            Pacote completo
+          </button>
           <button
             type="button"
             className={btnAccent}

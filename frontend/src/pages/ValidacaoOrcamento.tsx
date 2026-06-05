@@ -15,10 +15,11 @@ import {
   Download,
   CheckCircle2,
   Layers,
+  LayoutList,
+  FileSpreadsheet,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
-  exportToXLSX,
   getOrcamento,
   getOrcamentoFromFirebase,
   getOrcamentoPdf,
@@ -37,7 +38,8 @@ import {
   isExecutiveItem,
 } from "../features/orcamentos/recalcularCurvaABC";
 import type { NovoOrcamentoFlowState } from "../features/orcamentos/outputModels";
-import { CURVA_ABC_ONLY } from "../features/orcamentos/outputModels";
+import { CURVA_ABC_ONLY, FULL_ORCAMENTO_EXPORT } from "../features/orcamentos/outputModels";
+import { exportOrcamentoExcel } from "../features/orcamentos/exportOrcamento";
 import { WizardStepper } from "../components/WizardStepper";
 import {
   ANALISE_ABC_VALIDATION_STEP,
@@ -219,6 +221,7 @@ export default function ValidacaoOrcamento() {
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string>("");
   const [isExporting, setIsExporting] = useState(false);
+  const [isExportingFull, setIsExportingFull] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [deleteItemId, setDeleteItemId] = useState<number | null>(null);
   const [selectAll, setSelectAll] = useState(false);
@@ -599,7 +602,12 @@ export default function ValidacaoOrcamento() {
     setNumPages(numPages);
   };
 
-  // Handler de Exportação XLSX
+  const nomeProjetoExport =
+    (flowState?.nomeProjeto as string | undefined) ||
+    pdfFile?.name?.replace(/\.pdf$/i, "") ||
+    undefined;
+
+  // Handler de Exportação XLSX (Curva ABC)
   const handleExport = async () => {
     if (items.length === 0) {
       toast.warning("Nada para exportar", {
@@ -610,8 +618,10 @@ export default function ValidacaoOrcamento() {
 
     setIsExporting(true);
     try {
-      await exportToXLSX(items, {
+      await exportOrcamentoExcel({
+        flatItems: items,
         modelosSelecionados: CURVA_ABC_ONLY,
+        nomeProjeto: nomeProjetoExport,
       });
       toast.success("Planilha exportada", {
         description: "O download do XLSX deve iniciar em instantes.",
@@ -622,6 +632,33 @@ export default function ValidacaoOrcamento() {
       toast.error("Falha ao exportar", { description: msg });
     } finally {
       setIsExporting(false);
+    }
+  };
+
+  const handleExportFull = async () => {
+    if (hierarchicalItems.length === 0 && items.length === 0) {
+      toast.warning("Nada para exportar", {
+        description: "Processe um PDF com estrutura hierárquica ou itens na planilha.",
+      });
+      return;
+    }
+
+    setIsExportingFull(true);
+    try {
+      await exportOrcamentoExcel({
+        hierarchicalItems: hierarchicalItems.length > 0 ? hierarchicalItems : undefined,
+        flatItems: items,
+        modelosSelecionados: FULL_ORCAMENTO_EXPORT,
+        nomeProjeto: nomeProjetoExport,
+      });
+      toast.success("Pacote completo exportado", {
+        description: "Analítico + Sintético + Curva ABC.",
+      });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : "Erro desconhecido";
+      toast.error("Falha ao exportar pacote", { description: msg });
+    } finally {
+      setIsExportingFull(false);
     }
   };
 
@@ -752,13 +789,31 @@ export default function ValidacaoOrcamento() {
         <div className="flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
           <button
             type="button"
+            disabled={
+              isLoading ||
+              (hierarchicalItems.length === 0 && items.length === 0) ||
+              isExportingFull
+            }
+            className={`${btnMuted} shrink-0`}
+            onClick={() => void handleExportFull()}
+            title="Analítico + Sintético + Curva ABC"
+          >
+            {isExportingFull ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <FileSpreadsheet className="h-4 w-4" />
+            )}
+            {isExportingFull ? "Exportando…" : "Pacote completo"}
+          </button>
+          <button
+            type="button"
             disabled={isLoading || items.length === 0 || isExporting}
             className={`${btnMuted} shrink-0`}
-            onClick={handleExport}
-            title="Exportar planilha em XLSX"
+            onClick={() => void handleExport()}
+            title="Exportar apenas Curva ABC"
           >
             <Download className="h-4 w-4" />
-            {isExporting ? "Exportando…" : "Exportar"}
+            {isExporting ? "Exportando…" : "Exportar ABC"}
           </button>
           <button
             type="button"
@@ -788,6 +843,25 @@ export default function ValidacaoOrcamento() {
           >
             <Layers className="h-4 w-4" />
             Orçamento Analítico
+          </button>
+          <button
+            type="button"
+            disabled={isLoading || hierarchicalItems.length === 0}
+            className={`${btnMuted} shrink-0`}
+            onClick={() => {
+              const id = resolvedUploadId || "unknown";
+              navigate(`/orcamento-sintetico/${id}`, {
+                state: {
+                  ...flowState,
+                  uploadId: id,
+                  hierarchicalItems,
+                },
+              });
+            }}
+            title="Ver resumo gerencial por grupos"
+          >
+            <LayoutList className="h-4 w-4" />
+            Orçamento Sintético
           </button>
           <button
             type="button"

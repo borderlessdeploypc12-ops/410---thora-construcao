@@ -22,10 +22,17 @@ export const SINTETICO_ONLY: OutputModelsSelection = {
   curva_abc: false,
 };
 
-/** Único modelo ativo no fluxo atual (Curva ABC). */
+/** Curva ABC apenas. */
 export const CURVA_ABC_ONLY: OutputModelsSelection = {
   analitico: false,
   sintetico: false,
+  curva_abc: true,
+};
+
+/** Pacote completo: Analítico + Sintético + Curva ABC (3 abas). */
+export const FULL_ORCAMENTO_EXPORT: OutputModelsSelection = {
+  analitico: true,
+  sintetico: true,
   curva_abc: true,
 };
 

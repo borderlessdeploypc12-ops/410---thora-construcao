@@ -681,19 +681,19 @@ def build_export_workbook(
             gerar_aba_analitica(ws, analitico_rows, nome_obra=nome_projeto)
             sheets_created.append("Orçamento Analítico")
 
-    if models.get("curva_abc"):
-        abc_rows, total_geral = prepare_curva_abc_rows(items)
-        if abc_rows:
-            ws = wb.create_sheet("Curva ABC")
-            _fill_curva_abc_sheet(ws, abc_rows, total_geral)
-            sheets_created.append("Curva ABC")
-
     if models.get("sintetico"):
         sintetico_rows = prepare_sintetico_rows(items)
         if sintetico_rows:
             ws = wb.create_sheet("Orçamento Sintético")
             gerar_aba_sintetica(ws, sintetico_rows, nome_obra=nome_projeto)
             sheets_created.append("Orçamento Sintético")
+
+    if models.get("curva_abc"):
+        abc_rows, total_geral = prepare_curva_abc_rows(items)
+        if abc_rows:
+            ws = wb.create_sheet("Curva ABC")
+            _fill_curva_abc_sheet(ws, abc_rows, total_geral)
+            sheets_created.append("Curva ABC")
 
     if not sheets_created:
         raise ValueError(
