@@ -77,6 +77,7 @@ const Dashboard: React.FC = () => {
     } catch (e: unknown) {
       const msg =
         e instanceof Error ? e.message : "Não foi possível carregar os orçamentos.";
+      console.error("[Dashboard] Falha ao carregar orçamentos:", e);
       setLoadError(msg);
       toast.error("Falha ao carregar dados", { description: msg });
     } finally {

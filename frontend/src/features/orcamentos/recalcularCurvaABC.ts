@@ -7,7 +7,10 @@ export interface OrcamentoItem {
   item?: string;
   tipo?: string;
   banco?: string;
+  /** Código de referência do edital/PDF (SINAPI, DER, etc.). */
   code: string;
+  /** Código interno do cliente — busca no catálogo. */
+  catalogCode?: string;
   description: string;
   bdi: number;
   unit: string;
@@ -16,6 +19,10 @@ export interface OrcamentoItem {
   unitPrice: number;
   /** Preço total com BDI: qty × unitPrice × (1 + bdi/100). */
   lineTotal: number;
+  /** Referência do edital antes de aplicar catálogo (s/ BDI). */
+  referenceUnitPrice?: number;
+  /** Total c/ BDI da referência do edital. */
+  referenceLineTotal?: number;
   selected?: boolean;
   classification?: "A" | "B" | "C";
   individual_percentage?: number;

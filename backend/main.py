@@ -339,34 +339,73 @@ _OFFLINE_CACHE = {}
 
 # ============== HELPERS & DEPENDENCIES ==============
 
+def _decode_firebase_uid_from_jwt(token: str) -> str | None:
+    """Extrai UID do payload JWT (fallback quando Admin SDK não está disponível)."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1]
+        padding = (-len(payload_b64)) % 4
+        payload = json.loads(
+            base64.urlsafe_b64decode(payload_b64 + ("=" * padding))
+        )
+        uid = payload.get("user_id") or payload.get("sub")
+        return str(uid) if uid else None
+    except Exception:
+        return None
+
+
+def _resolve_uid_from_bearer_token(token: str) -> str | None:
+    token = token.strip()
+    if not token:
+        return None
+    try:
+        decoded = firebase_auth.verify_id_token(token)
+        uid = decoded.get("uid")
+        return str(uid) if uid else None
+    except Exception:
+        if ENVIRONMENT == "development":
+            return _decode_firebase_uid_from_jwt(token)
+        return None
+
+
+def _assert_upload_access(user_id: str, expected_user: str | None) -> None:
+    """Garante que o usuário autenticado pode acessar o upload."""
+    if not expected_user:
+        if ENVIRONMENT != "development":
+            raise HTTPException(status_code=403, detail="Acesso negado")
+        return
+    if str(expected_user) == str(user_id):
+        return
+    if ENVIRONMENT == "development":
+        logger.warning(
+            "⚠️  Dev: ignorando mismatch de userId (legado=%s, atual=%s)",
+            expected_user,
+            user_id,
+        )
+        return
+    raise HTTPException(status_code=403, detail="Acesso negado")
+
+
 async def get_current_user_id(request: Request) -> str:
-    """
-    Extrai user_id do Firebase token ou retorna um ID de desenvolvimento
-    TODO: Implementar validação real com Firebase
-    """
-    # Tenta extrair do header Authorization: Bearer <token>
+    """Extrai UID do Firebase a partir do Bearer token ou headers de fallback."""
     anonymous_user_id = request.headers.get("X-Anonymous-User", "").strip()
     auth_header = request.headers.get("Authorization", "").strip()
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        try:
-            # Em development, aceita qualquer token
-            if ENVIRONMENT == "development":
-                return token[:20] if len(token) > 20 else token
-            # Em produção, validar com Firebase (TODO)
-            # decoded = firebase_auth.verify_id_token(token)
-            # return decoded.get("uid", "anonymous")
-        except Exception as e:
-            logger.warning(f"⚠️ Erro ao validar token: {e}")
+        uid = _resolve_uid_from_bearer_token(token)
+        if uid:
+            return uid
+        logger.warning("⚠️ Bearer token presente, mas UID não pôde ser resolvido")
 
     if anonymous_user_id:
         return anonymous_user_id
-    
-    # Fallback: gerar ID anônimo se nenhum identificador foi enviado
+
     if ENVIRONMENT == "development":
         return "dev-user-" + str(uuid.uuid4())[:8]
-    
-    return "anon-server-" + str(uuid.uuid4())[:8]
+
+    raise HTTPException(status_code=401, detail="Não autenticado")
 
 
 def _meta_path_for_upload_id(upload_id: str) -> Path:
@@ -1439,10 +1478,7 @@ async def extract_pdf(
 
         meta = _load_upload_meta(upload_id)
         expected_user = meta.get("userId")
-        if expected_user and str(expected_user) != str(user_id):
-            raise HTTPException(status_code=403, detail="Acesso negado")
-        if not expected_user and ENVIRONMENT != "development":
-            raise HTTPException(status_code=403, detail="Acesso negado")
+        _assert_upload_access(user_id, expected_user)
         filename = str(meta.get("filename") or file_path.name)
 
         try:
@@ -1563,10 +1599,7 @@ async def detect_orcamento_tables(
 
     meta = _load_upload_meta(upload_id)
     expected_user = meta.get("userId")
-    if expected_user and str(expected_user) != str(user_id):
-        raise HTTPException(status_code=403, detail="Acesso negado")
-    if not expected_user and ENVIRONMENT != "development":
-        raise HTTPException(status_code=403, detail="Acesso negado")
+    _assert_upload_access(user_id, expected_user)
 
     try:
         # 1. Detectar tabelas com Camelot
@@ -1696,10 +1729,7 @@ async def process_orcamento_confirmed(
 
     meta = _load_upload_meta(upload_id)
     expected_user = meta.get("userId")
-    if expected_user and str(expected_user) != str(user_id):
-        raise HTTPException(status_code=403, detail="Acesso negado")
-    if not expected_user and ENVIRONMENT != "development":
-        raise HTTPException(status_code=403, detail="Acesso negado")
+    _assert_upload_access(user_id, expected_user)
 
     filename = str(meta.get("filename") or file_path.name)
 
@@ -2161,10 +2191,7 @@ async def process_analitico_full_pdf(
 
     meta = _load_upload_meta(upload_id)
     expected_user = meta.get("userId")
-    if expected_user and str(expected_user) != str(user_id):
-        raise HTTPException(status_code=403, detail="Acesso negado")
-    if not expected_user and ENVIRONMENT != "development":
-        raise HTTPException(status_code=403, detail="Acesso negado")
+    _assert_upload_access(user_id, expected_user)
 
     if not payload.force_reprocess:
         cached = _cached_analitico_payload(upload_id)
@@ -2215,10 +2242,7 @@ async def process_analitico_full_status(
     upload_id = _validate_upload_id(upload_id)
     meta = _load_upload_meta(upload_id)
     expected_user = meta.get("userId")
-    if expected_user and str(expected_user) != str(user_id):
-        raise HTTPException(status_code=403, detail="Acesso negado")
-    if not expected_user and ENVIRONMENT != "development":
-        raise HTTPException(status_code=403, detail="Acesso negado")
+    _assert_upload_access(user_id, expected_user)
 
     job = get_job(upload_id)
     if job:
@@ -2333,8 +2357,7 @@ async def analyze_with_ai(
             )
 
         expected_user = upload_data.get("userId")
-        if expected_user and str(expected_user) != str(user_id):
-            raise HTTPException(status_code=403, detail="Acesso negado")
+        _assert_upload_access(user_id, expected_user)
 
         tables_text = _build_tables_text_for_ai(upload_data)
         if not tables_text.strip():
@@ -2583,9 +2606,93 @@ async def get_ai_analysis(upload_id: str):
     }
 
 def _is_executive_budget_item(item: Dict[str, Any]) -> bool:
-    tipo = str(item.get("tipo") or "item").lower()
+    """Itens executivos para Curva ABC: apenas tipo 'item', sem totais de grupo."""
+    tipo = str(
+        item.get("tipo_linha") or item.get("tipo") or "item"
+    ).strip().lower()
     desc = str(item.get("descricao") or item.get("description") or "").lower()
-    return tipo != "grupo" and "total do grupo" not in desc
+    if tipo in ("grupo", "composicao", "composição", "insumo", "subitem", "titulo", "título"):
+        return False
+    if "total do grupo" in desc or desc.startswith("total "):
+        return False
+    return tipo == "item"
+
+
+def _apply_abc_classification(executives: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aplica Curva ABC (Pareto 80/95) in-place em itens executivos já filtrados."""
+    for item in executives:
+        line_total = _item_line_total(item)
+        if line_total > 0:
+            item["valor_total"] = line_total
+            item["lineTotal"] = line_total
+
+    executives.sort(
+        key=lambda row: (
+            -_item_line_total(row),
+            str(row.get("codigo") or row.get("id") or ""),
+        ),
+    )
+
+    total_value = sum(_item_line_total(row) for row in executives)
+    accumulated = 0.0
+
+    for item in executives:
+        line_total = _item_line_total(item)
+        pct_before = (accumulated / total_value * 100) if total_value > 0 else 0
+        accumulated += line_total
+        item["accumulated_percentage"] = round(
+            (accumulated / total_value * 100) if total_value > 0 else 0,
+            1,
+        )
+        item["individual_percentage"] = round(
+            (line_total / total_value * 100) if total_value > 0 else 0,
+            1,
+        )
+        if pct_before < 80:
+            item["classification"] = "A"
+        elif pct_before < 95:
+            item["classification"] = "B"
+        else:
+            item["classification"] = "C"
+
+    value_a = sum(
+        _item_line_total(i) for i in executives if i.get("classification") == "A"
+    )
+    value_b = sum(
+        _item_line_total(i) for i in executives if i.get("classification") == "B"
+    )
+    value_c = sum(
+        _item_line_total(i) for i in executives if i.get("classification") == "C"
+    )
+
+    return {
+        "total": total_value,
+        "countA": sum(1 for i in executives if i.get("classification") == "A"),
+        "countB": sum(1 for i in executives if i.get("classification") == "B"),
+        "countC": sum(1 for i in executives if i.get("classification") == "C"),
+        "valueA": value_a,
+        "valueB": value_b,
+        "valueC": value_c,
+        "percentA": round((value_a / total_value * 100), 1) if total_value > 0 else 0,
+        "percentB": round((value_b / total_value * 100), 1) if total_value > 0 else 0,
+        "percentC": round((value_c / total_value * 100), 1) if total_value > 0 else 0,
+    }
+
+
+def _classify_abc_items(
+    items: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Filtra itens executivos, normaliza valor_total e aplica Curva ABC (Pareto 80/95)."""
+    executives: List[Dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict) or not _is_executive_budget_item(raw):
+            continue
+        if _item_line_total(raw) <= 0:
+            continue
+        executives.append(dict(raw))
+
+    summary = _apply_abc_classification(executives)
+    return executives, summary
 
 
 def _item_line_total(item: Dict[str, Any]) -> float:
@@ -2614,34 +2721,7 @@ def _enrich_items_with_abc(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Recalcula totais e classificação A/B/C (Pareto) quando ausentes no Firestore."""
     enriched: List[Dict[str, Any]] = [dict(item) for item in items]
     executives = [item for item in enriched if _is_executive_budget_item(item)]
-
-    for item in executives:
-        item["lineTotal"] = _item_line_total(item)
-
-    executives.sort(
-        key=lambda row: (_item_line_total(row), str(row.get("codigo") or row.get("code") or "")),
-        reverse=True,
-    )
-    total_value = sum(_item_line_total(row) for row in executives)
-    accumulated = 0.0
-
-    for item in executives:
-        line_total = _item_line_total(item)
-        prev_pct = (accumulated / total_value * 100.0) if total_value else 0.0
-        accumulated += line_total
-        if prev_pct < 80:
-            item["classification"] = "A"
-        elif prev_pct < 95:
-            item["classification"] = "B"
-        else:
-            item["classification"] = "C"
-        item["individual_percentage"] = (
-            (line_total / total_value * 100.0) if total_value else 0.0
-        )
-        item["accumulated_percentage"] = (
-            (accumulated / total_value * 100.0) if total_value else 0.0
-        )
-
+    _apply_abc_classification(executives)
     return enriched
 
 
@@ -3304,8 +3384,7 @@ async def get_orcamento_pdf(
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             owner = meta.get("userId")
-            if owner and str(owner) != str(user_id):
-                raise HTTPException(status_code=403, detail="Acesso negado")
+            _assert_upload_access(user_id, owner)
         except json.JSONDecodeError:
             pass
     return FileResponse(
@@ -3330,7 +3409,7 @@ async def list_orcamentos(user_id: str = Depends(get_current_user_id)):
         }
     """
     try:
-        orcamentos = OrcamentoFirestore.list_all_orcamentos()
+        orcamentos = OrcamentoFirestore.list_all_orcamentos(user_id=user_id)
         return {
             "status": "success",
             "count": len(orcamentos),
@@ -3512,8 +3591,7 @@ async def get_curva_abc(
             )
             if orcamento:
                 expected_user = orcamento.get("userId")
-                if expected_user and str(expected_user) != str(user_id):
-                    raise HTTPException(status_code=403, detail="Acesso negado")
+                _assert_upload_access(user_id, expected_user)
         
         if not orcamento:
             raise HTTPException(
@@ -3581,54 +3659,12 @@ async def get_curva_abc(
                     "percentC": 0
                 }
             }
-        
-        # Ordenar por valor total decrescente
-        items.sort(key=lambda x: x["valor_total"], reverse=True)
-        
-        # Calcular total e percentuais acumulados (regra Pareto 80/15/5 em valor)
-        # Classifica pelo % acumulado *antes* do item: quem ainda não atingiu 80% do valor total em A
-        # (inclui o item que cruza o corte); evita um único item dominante cair em C.
-        total_value = sum(item["valor_total"] for item in items)
-        accumulated = 0
 
-        for item in items:
-            pct_before = (accumulated / total_value * 100) if total_value > 0 else 0
-            accumulated += item["valor_total"]
-            accumulated_percentage = (accumulated / total_value * 100) if total_value > 0 else 0
-            item["accumulated_percentage"] = round(accumulated_percentage, 1)
+        classified_items, summary = _classify_abc_items(items)
 
-            if pct_before < 80:
-                item["classification"] = "A"
-            elif pct_before < 95:
-                item["classification"] = "B"
-            else:
-                item["classification"] = "C"
-        
-        # Calcular resumo
-        countA = sum(1 for item in items if item["classification"] == "A")
-        countB = sum(1 for item in items if item["classification"] == "B")
-        countC = sum(1 for item in items if item["classification"] == "C")
-        
-        valueA = sum(item["valor_total"] for item in items if item["classification"] == "A")
-        valueB = sum(item["valor_total"] for item in items if item["classification"] == "B")
-        valueC = sum(item["valor_total"] for item in items if item["classification"] == "C")
-        
-        summary = {
-            "total": total_value,
-            "countA": countA,
-            "countB": countB,
-            "countC": countC,
-            "valueA": valueA,
-            "valueB": valueB,
-            "valueC": valueC,
-            "percentA": round((valueA / total_value * 100), 1) if total_value > 0 else 0,
-            "percentB": round((valueB / total_value * 100), 1) if total_value > 0 else 0,
-            "percentC": round((valueC / total_value * 100), 1) if total_value > 0 else 0,
-        }
-        
         return {
             "status": "success",
-            "items": items,
+            "items": classified_items,
             "summary": summary
         }
         
@@ -3796,10 +3832,35 @@ async def serve_frontend(path_name: str):
     return {"error": "Frontend not available"}
 
 # ============== RUN ==============
+def _is_port_in_use(port: int) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", port))
+            return False
+        except OSError:
+            return True
+
+
 if __name__ == "__main__":
+    import sys
     import uvicorn
-    import os
+
     port = int(os.getenv("PORT", 8000))
+
+    if _is_port_in_use(port):
+        print(f"\n[ERRO] A porta {port} ja esta em uso — outro servidor ja esta rodando.")
+        print(f"   Acesse: http://localhost:{port}")
+        print(
+            f"\n   Para encerrar o processo anterior (PowerShell):\n"
+            f"   Get-NetTCPConnection -LocalPort {port} | "
+            f"ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force }}\n"
+        )
+        sys.exit(1)
+
+    print(f"Thora API em http://localhost:{port}")
     uvicorn.run(
         "main:app",
         host="0.0.0.0",

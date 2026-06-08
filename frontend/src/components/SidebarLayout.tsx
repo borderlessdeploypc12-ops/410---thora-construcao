@@ -2,14 +2,12 @@ import React, { useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   Home,
-  FileText,
   BarChart3,
   Menu,
   X,
   LogOut,
   Upload,
-  LayoutList,
-  Layers,
+  Package,
 } from "lucide-react";
 import { signOutCurrentUser } from "../features/auth/authService";
 
@@ -36,12 +34,6 @@ const SidebarLayout: React.FC<SidebarLayoutProps> = ({ children }) => {
         location.pathname.startsWith("/curva-abc")
       );
     }
-    if (path === "/orcamento-analitico") {
-      return location.pathname.startsWith("/orcamento-analitico");
-    }
-    if (path === "/orcamento-sintetico") {
-      return location.pathname.startsWith("/orcamento-sintetico");
-    }
     return (
       location.pathname === path || location.pathname.startsWith(`${path}/`)
     );
@@ -50,8 +42,7 @@ const SidebarLayout: React.FC<SidebarLayoutProps> = ({ children }) => {
   const menuItems = [
     { path: "/", label: "Dashboard", icon: Home },
     { path: "/orcamento", label: "Curva ABC", icon: Upload },
-    { path: "/orcamento-analitico", label: "Orçamento Analítico", icon: Layers },
-    { path: "/orcamento-sintetico", label: "Orçamento Sintético", icon: LayoutList },
+    { path: "/catalogo", label: "Meu Catálogo", icon: Package },
     { path: "/relatorios", label: "Relatórios", icon: BarChart3 },
   ];
 

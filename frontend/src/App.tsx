@@ -5,6 +5,7 @@ import ValidacaoOrcamento from "./pages/ValidacaoOrcamento";
 import CurvaABC from "./pages/CurvaABC";
 import OrcamentoAnalitico from "./pages/OrcamentoAnalitico";
 import OrcamentoSintetico from "./pages/OrcamentoSintetico";
+import CatalogoProdutos from "./pages/CatalogoProdutos";
 import Reports from "./pages/Reports";
 import AnaliseDetalhada from "./pages/AnaliseDetalhada";
 import Login from "./pages/Login";
@@ -33,6 +34,7 @@ const App = () => {
           path="/analise-detalhada/:uploadId"
           element={<AnaliseDetalhada />}
         />
+        <Route path="/catalogo" element={<CatalogoProdutos />} />
         <Route path="/relatorios" element={<Reports />} />
         <Route path="/analytics" element={<Navigate to="/" replace />} />
       </Route>

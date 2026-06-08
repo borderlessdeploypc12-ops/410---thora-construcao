@@ -79,8 +79,16 @@ export async function listOrcamentosByUserId(
     orderBy("uploadedAt", "desc"),
   );
 
-  const snap = await getDocs(q);
-  return snap.docs.map(mapOrcamentoDoc);
+  try {
+    const snap = await getDocs(q);
+    return snap.docs.map(mapOrcamentoDoc);
+  } catch (error) {
+    console.error(
+      "[Firestore] Falha ao listar orçamentos:",
+      { userId, error },
+    );
+    throw error;
+  }
 }
 
 export type UpsertOrcamentoInput = Omit<

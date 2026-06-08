@@ -81,15 +81,19 @@ EXTRACTION_SYSTEM_PROMPT = (
     "3. RIGOR COM NÚMEROS E UNIDADES: 'unidade' só com siglas (M2, M3, UN, m, T, TKm). Separe número e unidade se vierem juntos.\n"
     "4. LIMPEZA MATEMÁTICA: Remova 'R$' e '%'. Converta padrão brasileiro para float (ex: '3.017,500' → 3017.5; '17.260,10' → 17260.10; '20,81' → 20.81).\n"
     "5. COLUNA BDI (%): Extraia o percentual da coluna BDI de cada linha de serviço (ex: '20,81' ou '20,81%' → 20.81). Não use taxas de páginas de resumo de BDI.\n"
-    "6. FÓRMULA DE CONSISTÊNCIA: quantidade × valor_unitario ≈ valor_total (tolerância ~2%). Se não bater, re-leia a linha e corrija o alinhamento das colunas.\n"
-    "7. HIERARQUIA (tipo_linha): Preserve a ordem sequencial do PDF.\n"
+    "6. PREÇO COM BDI: Quando existirem colunas 'Preço Unit. S/ BDI' e 'Preço Unit. C/ BDI' (ou 'Preço Total S/ BDI' e 'Preço Total C/ BDI'), "
+    "use SEMPRE os valores **C/ BDI** (com BDI) em valor_unitario e valor_total. Esses são os valores econômicos corretos para Curva ABC.\n"
+    "7. FÓRMULA DE CONSISTÊNCIA: quantidade × valor_unitario ≈ valor_total (tolerância ~2%). Se não bater, re-leia a linha e corrija o alinhamento das colunas.\n"
+    "8. HIERARQUIA (tipo_linha): Preserve a ordem sequencial do PDF.\n"
     "   - 'grupo': títulos de capítulo/subgrupo (ex: '1. GRUPO 1: SERVIÇOS DEMOLIÇÃO') ou linhas 'Total do grupo'.\n"
-    "   - 'item': serviços principais com código e quantidade (ex: numeração 1.1, 1.2).\n"
-    "   - 'composicao': insumos/subitens indentados sob um item (composição analítica, ex: 1.1.1).\n"
-    "8. item_numero: numeração hierárquica exata do edital (ex: '1', '1.1', '1.1.1'). Use null se ausente.\n"
+    "   - 'item': serviços principais com código e quantidade (ex: numeração 1.1, 1.2). SOMENTE estes entram na Curva ABC.\n"
+    "   - 'composicao': insumos/subitens indentados sob um item (composição analítica, ex: 1.1.1). "
+    "Extraia para planilha analítica, mas NÃO repita o valor total do item pai — use apenas o custo do insumo.\n"
+    "9. item_numero: numeração hierárquica exata do edital (ex: '1', '1.1', '1.1.1'). Use null se ausente.\n"
     "   A coluna item_numero DEVE preservar rigorosamente a numeração original do PDF (ex: 1, 1.1, 1.1.1). Não crie sequências novas, copie o índice exato que está no documento.\n"
-    "9. banco: fonte de referência (SINAPI, SICRO, Próprio, etc.). Use null se não houver.\n"
-    "10. REMOÇÃO DE LIXO: Ignore cabeçalhos repetidos de coluna, 'RESUMO GERAL', 'MAPA DE COTAÇÃO', linhas institucionais.\n"
+    "10. banco: fonte de referência (SINAPI, SICRO, Próprio, etc.). Use null se não houver.\n"
+    "11. REMOÇÃO DE LIXO: Ignore cabeçalhos repetidos de coluna, 'RESUMO GERAL', 'MAPA DE COTAÇÃO', linhas institucionais, "
+    "linhas de percentual (% do total) sem quantidade/preço, e subtotais de grupo.\n"
     "    NÃO remova linhas de grupo, item ou composição da planilha analítica.\n\n"
     "FORMATO DE SAÍDA OBRIGATÓRIO (JSON):\n"
     "Retorne um array de objetos JSON chamado orcamento_itens seguindo exatamente este schema:\n"
@@ -112,7 +116,9 @@ EXTRACTION_SYSTEM_PROMPT = (
 )
 
 EXTRACTION_USER_PROMPT_HEADER = (
-    "Extraia a tabela selecionada seguindo rigorosamente as regras do sistema, em especial o MAPEAMENTO ESPACIAL e o SANITY CHECK (Qtd * VU = Total)."
+    "Extraia a tabela selecionada seguindo rigorosamente as regras do sistema, em especial: "
+    "MAPEAMENTO ESPACIAL, valores C/ BDI quando existirem, SANITY CHECK (Qtd × VU ≈ Total), "
+    "e tipo_linha correto (item = serviço executivo para Curva ABC; composicao = insumo sem duplicar valor do pai)."
 )
 
 ANALITICO_FULL_SYSTEM_PROMPT = (

@@ -37,6 +37,16 @@ import {
   resolveStructuredItemPricing,
   isExecutiveItem,
 } from "../features/orcamentos/recalcularCurvaABC";
+import {
+  listCatalogoByUserId,
+} from "../features/catalogo/catalogoRepository";
+import type { CatalogoProduto } from "../features/catalogo/catalogoTypes";
+import {
+  aplicarProdutoCatalogo,
+  calcularEconomia,
+  normalizeCatalogCode,
+  snapshotReferenciaOrcamento,
+} from "../features/catalogo/catalogoUtils";
 import type { NovoOrcamentoFlowState } from "../features/orcamentos/outputModels";
 import { CURVA_ABC_ONLY, FULL_ORCAMENTO_EXPORT } from "../features/orcamentos/outputModels";
 import { exportOrcamentoExcel } from "../features/orcamentos/exportOrcamento";
@@ -183,12 +193,22 @@ const mapStoredItemsToValidation = (rawItems: unknown[]): ItemOrcamento[] => {
       tipo: String(item.tipo ?? "item"),
       banco: String(item.banco ?? ""),
       code: String(item.codigo ?? item.code ?? id).trim() || String(id).padStart(3, "0"),
+      catalogCode:
+        typeof item.catalogCode === "string" ? item.catalogCode : undefined,
       description,
       bdi,
       unit: String(item.unidade ?? item.unit ?? "un").trim() || "un",
       qty: pricing.qty || qty,
       unitPrice: unitFromStore,
       lineTotal: 0,
+      referenceUnitPrice:
+        typeof item.referenceUnitPrice === "number"
+          ? item.referenceUnitPrice
+          : undefined,
+      referenceLineTotal:
+        typeof item.referenceLineTotal === "number"
+          ? item.referenceLineTotal
+          : undefined,
       selected: false,
       classification: item.classification as "A" | "B" | "C" | undefined,
       individual_percentage:
@@ -225,10 +245,34 @@ export default function ValidacaoOrcamento() {
   const [isSaving, setIsSaving] = useState(false);
   const [deleteItemId, setDeleteItemId] = useState<number | null>(null);
   const [selectAll, setSelectAll] = useState(false);
+  const [catalogo, setCatalogo] = useState<CatalogoProduto[]>([]);
 
   const abcResumo = useMemo(() => calcularResumoAbc(items), [items]);
 
-  const applyAbcToItems = (raw: ItemOrcamento[]) => recalcularCurvaABC(raw);
+  const economiaTotal = useMemo(
+    () => items.reduce((sum, item) => sum + calcularEconomia(item), 0),
+    [items],
+  );
+
+  const catalogMap = useMemo(() => {
+    const map = new Map<string, CatalogoProduto>();
+    for (const p of catalogo) {
+      map.set(normalizeCatalogCode(p.catalogCode), p);
+    }
+    return map;
+  }, [catalogo]);
+
+  const applyAbcToItems = (raw: ItemOrcamento[]) =>
+    recalcularCurvaABC(raw.map(snapshotReferenciaOrcamento));
+
+  useEffect(() => {
+    if (!user?.uid) return;
+    void listCatalogoByUserId(user.uid)
+      .then(setCatalogo)
+      .catch(() => {
+        /* catálogo opcional na validação */
+      });
+  }, [user?.uid]);
 
   // States do PDF Viewer
   const [pdfFile, setPdfFile] = useState<File | null>(null);
@@ -552,6 +596,31 @@ export default function ValidacaoOrcamento() {
     });
   };
 
+  const handleCatalogCodeCommit = (itemId: number, rawCode: string) => {
+    const key = normalizeCatalogCode(rawCode);
+    if (!key) return;
+
+    const produto = catalogMap.get(key);
+    if (!produto) {
+      toast.warning("Código não encontrado no catálogo", {
+        description: "Cadastre em Meu Catálogo ou verifique o código.",
+      });
+      return;
+    }
+
+    setItems((prev) => {
+      const updated = prev.map((item) => {
+        if (item.id !== itemId) return item;
+        return aplicarProdutoCatalogo(item, produto);
+      });
+      return recalcularCurvaABC(updated);
+    });
+
+    toast.success("Preço do catálogo aplicado", {
+      description: produto.description,
+    });
+  };
+
   const confirmRemoveItem = () => {
     if (deleteItemId == null) return;
     setItems((prev) => recalcularCurvaABC(prev.filter((item) => item.id !== deleteItemId)));
@@ -695,11 +764,14 @@ export default function ValidacaoOrcamento() {
         tipo: item.tipo,
         banco: item.banco,
         code: item.code,
+        catalogCode: item.catalogCode,
         description: item.description,
         bdi: item.bdi,
         unit: item.unit,
         quantity: item.qty,
         unitValue: item.unitPrice,
+        referenceUnitPrice: item.referenceUnitPrice,
+        referenceLineTotal: item.referenceLineTotal,
         totalValue:
           item.lineTotal > 0
             ? item.lineTotal
@@ -1051,7 +1123,7 @@ export default function ValidacaoOrcamento() {
           {/* Mini dashboard Curva ABC */}
           {!isLoading && !loadError && items.length > 0 && (
             <div className="shrink-0 border-b border-slate-100 bg-slate-50/50 px-6 py-4">
-              <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-5">
                 <div className="rounded-xl border border-blue-200 bg-white p-4 shadow-sm">
                   <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                     Total geral (c/ BDI)
@@ -1096,10 +1168,21 @@ export default function ValidacaoOrcamento() {
                     R$ {formatMoney(abcResumo.classeC.valor)}
                   </p>
                 </div>
+                <div className="rounded-xl border border-violet-200 bg-violet-50/40 p-4 shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-violet-800">
+                    Economia vs. edital
+                  </p>
+                  <p className="mt-2 text-xl font-bold tabular-nums text-violet-900 transition-all duration-300">
+                    R$ {formatMoney(economiaTotal)}
+                  </p>
+                  <p className="mt-1 text-xs text-violet-700">
+                    Informe o código do catálogo na tabela
+                  </p>
+                </div>
               </div>
               <p className="mt-3 text-xs text-slate-500">
-                Edite Quantidade, Valor Unitário (s/ BDI) ou BDI (%) na tabela — a Curva ABC
-                e os totais atualizam em tempo real.
+                Use a coluna <strong>Cód. catálogo</strong> para aplicar seu preço cadastrado.
+                A economia compara o total do edital com seu preço (quando menor).
               </p>
             </div>
           )}
@@ -1154,7 +1237,10 @@ export default function ValidacaoOrcamento() {
                         />
                       </th>
                       <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider w-24">
-                        Código
+                        Cód. ref.
+                      </th>
+                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider w-28">
+                        Cód. catálogo
                       </th>
                       <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider w-20">
                         Banco
@@ -1182,6 +1268,9 @@ export default function ValidacaoOrcamento() {
                       </th>
                       <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right w-28 bg-slate-100">
                         Total c/ BDI
+                      </th>
+                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right w-28">
+                        Economia
                       </th>
                       <th className="px-2 py-3 w-8"></th>
                     </tr>
@@ -1230,7 +1319,27 @@ export default function ValidacaoOrcamento() {
                                     ? "text-emerald-700"
                                     : "text-slate-600"
                             }`}
-                            placeholder="Código"
+                            placeholder="Ref. edital"
+                          />
+                        </td>
+                        <td className="px-4 py-3">
+                          <input
+                            type="text"
+                            value={item.catalogCode ?? ""}
+                            onChange={(e) =>
+                              handleChange(item.id, "catalogCode", e.target.value)
+                            }
+                            onBlur={(e) =>
+                              handleCatalogCodeCommit(item.id, e.target.value)
+                            }
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.currentTarget.blur();
+                              }
+                            }}
+                            className="w-full rounded-md border border-violet-200 bg-violet-50/50 px-1.5 py-1 font-mono text-xs text-violet-900 focus:border-violet-400 focus:outline-none focus:ring-1 focus:ring-violet-300"
+                            placeholder="Seu código"
+                            title="Código do seu catálogo — Enter ou sair do campo para aplicar preço"
                           />
                         </td>
                         <td className="px-4 py-3">
@@ -1409,6 +1518,28 @@ export default function ValidacaoOrcamento() {
                           }`}>
                             {formatMoney(item.lineTotal)}
                           </span>
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          {(() => {
+                            const economia = calcularEconomia(item);
+                            if (economia <= 0) {
+                              return (
+                                <span className="text-xs text-slate-300">—</span>
+                              );
+                            }
+                            return (
+                              <span
+                                className="text-sm font-semibold tabular-nums text-violet-700"
+                                title={
+                                  item.referenceLineTotal
+                                    ? `Ref. edital: ${formatMoney(item.referenceLineTotal)}`
+                                    : undefined
+                                }
+                              >
+                                −{formatMoney(economia)}
+                              </span>
+                            );
+                          })()}
                         </td>
                         <td className="px-2 py-3 text-center">
                           <button
