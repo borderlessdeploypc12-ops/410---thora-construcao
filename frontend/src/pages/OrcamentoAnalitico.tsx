@@ -270,7 +270,7 @@ const OrcamentoAnalitico: React.FC = () => {
           mode="full_pdf"
           steps={ORCAMENTO_ANALITICO_WIZARD_STEPS}
           title="Orçamento Analítico"
-          subtitle={`Passo 1 de ${ORCAMENTO_ANALITICO_WIZARD_STEPS.length} — envie o PDF ou edital completo; a IA extrai itens de planilhas e de trechos em texto (quantidades, valores, serviços).`}
+          subtitle={`Passo 1 de ${ORCAMENTO_ANALITICO_WIZARD_STEPS.length} — envie um ou vários PDFs/editais; o processamento ocorre em fila sequencial com acompanhamento individual.`}
           processingLabel="Passo 2 — IA analisando todo o conteúdo do PDF (grupos, itens e composições)…"
           logTag="Orçamento Analítico"
           onComplete={handleWizardComplete}

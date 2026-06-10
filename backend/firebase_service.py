@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 import os
 
+from config import FIREBASE_STORAGE_BUCKET
+
 logger = logging.getLogger(__name__)
 
 # Initialize Firebase
@@ -32,10 +34,15 @@ else:
         try:
             # Try to load from environment variable first (Render)
             firebase_creds_env = os.getenv("FIREBASE_CREDENTIALS")
+            storage_options = (
+                {"storageBucket": FIREBASE_STORAGE_BUCKET}
+                if FIREBASE_STORAGE_BUCKET
+                else None
+            )
             if firebase_creds_env:
                 creds_dict = json.loads(firebase_creds_env)
                 creds = credentials.Certificate(creds_dict)
-                firebase_admin.initialize_app(creds)
+                firebase_admin.initialize_app(creds, storage_options)
                 db = firestore.client()
                 logger.info("✅ Firebase initialized com environment variable")
             else:
@@ -43,7 +50,7 @@ else:
                 creds_path = Path(__file__).parent / "firebase_credentials.json"
                 if creds_path.exists():
                     creds = credentials.Certificate(str(creds_path))
-                    firebase_admin.initialize_app(creds)
+                    firebase_admin.initialize_app(creds, storage_options)
                     db = firestore.client()
                     logger.info("✅ Firebase initialized com credentials file")
                 else:
@@ -70,6 +77,7 @@ class OrcamentoFirestore:
         tables: List[Dict[str, Any]],
         items_data: Dict[str, Any] = None,
         ia_metadata: Dict[str, Any] = None,
+        storage_url: str | None = None,
     ) -> str:
         """
         Save extracted PDF data to Firestore
@@ -101,7 +109,9 @@ class OrcamentoFirestore:
             }
             if ia_metadata:
                 doc_data["ia_metadata"] = ia_metadata
-            
+            if storage_url:
+                doc_data["storageUrl"] = storage_url
+
             # Add document to collection
             db.collection("orcamentos").add(doc_data)
             logger.info(f"✅ Orçamento salvo no Firebase: {upload_id}")
@@ -196,6 +206,37 @@ class OrcamentoFirestore:
             logger.error(f"❌ Erro ao atualizar orçamento: {str(e)}")
             return False
     
+    @staticmethod
+    def save_upload_record(
+        user_id: str,
+        upload_id: str,
+        filename: str,
+        storage_url: str | None = None,
+        size_bytes: int | None = None,
+    ) -> str:
+        """Registra metadados do upload (PDF original) no Firestore."""
+        if not db:
+            return upload_id
+
+        try:
+            doc_data = {
+                "userId": user_id,
+                "uploadId": upload_id,
+                "filename": filename,
+                "uploadedAt": datetime.now(),
+                "status": "uploaded",
+            }
+            if storage_url:
+                doc_data["storageUrl"] = storage_url
+            if size_bytes is not None:
+                doc_data["sizeBytes"] = size_bytes
+            db.collection("uploads").add(doc_data)
+            logger.info("Upload registrado no Firestore: %s", upload_id)
+            return upload_id
+        except Exception as e:
+            logger.error("Erro ao registrar upload no Firestore: %s", e)
+            return upload_id
+
     @staticmethod
     def delete_orcamento(doc_id: str) -> bool:
         """

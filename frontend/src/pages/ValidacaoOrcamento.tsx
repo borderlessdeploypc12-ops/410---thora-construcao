@@ -963,7 +963,7 @@ export default function ValidacaoOrcamento() {
       </header>
 
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden lg:flex-row">
-        <div className="flex max-h-[42vh] min-h-0 w-full flex-col border-b border-slate-200 bg-slate-100 lg:max-h-none lg:w-5/12 lg:border-b-0 lg:border-r">
+        <div className="flex max-h-[42vh] min-h-0 w-full flex-col border-b border-slate-200 bg-slate-100 lg:max-h-none lg:w-[38%] xl:w-5/12 lg:border-b-0 lg:border-r">
           {/* Toolbar do PDF */}
           <div className="h-12 bg-white border-b border-slate-200 flex items-center justify-between px-4 shrink-0 z-10 gap-2">
             <span className="text-xs font-semibold text-slate-500 uppercase shrink-0">
@@ -1216,7 +1216,7 @@ export default function ValidacaoOrcamento() {
 
           {/* Corpo Tabela com Scroll Independente */}
           {!isLoading && !loadError && (
-            <div className="flex-1 overflow-y-auto pb-20">
+            <div className="flex-1 overflow-auto pb-20">
               {items.length === 0 ? (
                 <div className="flex items-center justify-center h-full text-slate-400">
                   <div className="text-center">
@@ -1225,54 +1225,54 @@ export default function ValidacaoOrcamento() {
                   </div>
                 </div>
               ) : (
-                <table className="w-full text-left border-collapse">
-                  <thead className="bg-slate-50 sticky top-0 z-10 shadow-sm border-b border-slate-200">
+                <table className="min-w-[1320px] w-full border-collapse text-left text-sm">
+                  <thead className="border-b border-slate-200">
                     <tr>
-                      <th className="px-3 py-3 w-12">
+                      <th className="sticky top-0 z-20 w-10 bg-slate-50 px-2 py-3 shadow-[inset_0_-1px_0_#e2e8f0]">
                         <input
                           type="checkbox"
                           checked={selectAll}
                           onChange={handleSelectAll}
-                          className="w-4 h-4 text-blue-600 rounded cursor-pointer"
+                          className="h-4 w-4 cursor-pointer rounded text-blue-600"
                         />
                       </th>
-                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider w-24">
+                      <th className="sticky top-0 z-20 min-w-[6.5rem] whitespace-nowrap bg-slate-50 px-3 py-3 text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
                         Cód. ref.
                       </th>
-                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider w-28">
+                      <th className="sticky top-0 z-20 min-w-[7.5rem] whitespace-nowrap bg-slate-50 px-3 py-3 text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
                         Cód. catálogo
                       </th>
-                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider w-20">
+                      <th className="sticky top-0 z-20 min-w-[5rem] whitespace-nowrap bg-slate-50 px-3 py-3 text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
                         Banco
                       </th>
-                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider w-20">
+                      <th className="sticky top-0 z-20 min-w-[4.5rem] whitespace-nowrap bg-slate-50 px-3 py-3 text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
                         Tipo
                       </th>
-                      <th className="px-2 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider w-12 text-center">
+                      <th className="sticky top-0 z-20 w-12 whitespace-nowrap bg-slate-50 px-2 py-3 text-center text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
                         ABC
                       </th>
-                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                      <th className="sticky top-0 z-20 min-w-[14rem] bg-slate-50 px-3 py-3 text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
                         Descrição
                       </th>
-                      <th className="px-3 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right w-20">
+                      <th className="sticky top-0 z-20 min-w-[4.5rem] whitespace-nowrap bg-slate-50 px-3 py-3 text-right text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
                         BDI (%)
                       </th>
-                      <th className="px-2 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-center w-14">
+                      <th className="sticky top-0 z-20 w-14 whitespace-nowrap bg-slate-50 px-2 py-3 text-center text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
                         Un.
                       </th>
-                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right w-24">
+                      <th className="sticky top-0 z-20 min-w-[5rem] whitespace-nowrap bg-slate-50 px-3 py-3 text-right text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
                         Qtd.
                       </th>
-                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right w-28">
-                        V. Unit. s/ BDI
+                      <th className="sticky top-0 z-20 min-w-[6.5rem] whitespace-nowrap bg-slate-50 px-3 py-3 text-right text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
+                        V. unit. s/ BDI
                       </th>
-                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right w-28 bg-slate-100">
+                      <th className="sticky top-0 z-20 min-w-[6.5rem] whitespace-nowrap bg-slate-100 px-3 py-3 text-right text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
                         Total c/ BDI
                       </th>
-                      <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right w-28">
+                      <th className="sticky top-0 z-20 min-w-[5.5rem] whitespace-nowrap bg-slate-50 px-3 py-3 text-right text-xs font-semibold uppercase tracking-wider text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
                         Economia
                       </th>
-                      <th className="px-2 py-3 w-8"></th>
+                      <th className="sticky top-0 z-20 w-10 bg-slate-50 px-1 py-3 shadow-[inset_0_-1px_0_#e2e8f0]" />
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -1295,22 +1295,22 @@ export default function ValidacaoOrcamento() {
                           item.selected ? 'bg-blue-50/40' : rowBgClass
                         }`}
                       >
-                        <td className="px-3 py-3">
+                        <td className="px-2 py-2 align-top">
                           <input
                             type="checkbox"
                             checked={item.selected || false}
                             onChange={() => handleSelectItem(item.id)}
-                            className="w-4 h-4 text-blue-600 rounded cursor-pointer"
+                            className="h-4 w-4 cursor-pointer rounded text-blue-600"
                           />
                         </td>
-                        <td className="px-4 py-3">
+                        <td className="min-w-[6.5rem] px-3 py-2 align-top">
                           <input
                             type="text"
                             value={item.code}
                             onChange={(e) =>
                               handleChange(item.id, "code", e.target.value)
                             }
-                            className={`w-full bg-transparent font-mono text-xs focus:outline-none border-b border-transparent focus:border-blue-500 ${
+                            className={`w-full min-w-[5.5rem] bg-transparent font-mono text-xs focus:outline-none border-b border-transparent focus:border-blue-500 ${
                               item.classification === "A"
                                 ? "text-red-700"
                                 : item.classification === "B"
@@ -1322,7 +1322,7 @@ export default function ValidacaoOrcamento() {
                             placeholder="Ref. edital"
                           />
                         </td>
-                        <td className="px-4 py-3">
+                        <td className="min-w-[7.5rem] px-3 py-2 align-top">
                           <input
                             type="text"
                             value={item.catalogCode ?? ""}
@@ -1337,19 +1337,19 @@ export default function ValidacaoOrcamento() {
                                 e.currentTarget.blur();
                               }
                             }}
-                            className="w-full rounded-md border border-violet-200 bg-violet-50/50 px-1.5 py-1 font-mono text-xs text-violet-900 focus:border-violet-400 focus:outline-none focus:ring-1 focus:ring-violet-300"
+                            className="w-full min-w-[6.5rem] rounded-md border border-violet-200 bg-violet-50/50 px-2 py-1 font-mono text-xs text-violet-900 focus:border-violet-400 focus:outline-none focus:ring-1 focus:ring-violet-300"
                             placeholder="Seu código"
                             title="Código do seu catálogo — Enter ou sair do campo para aplicar preço"
                           />
                         </td>
-                        <td className="px-4 py-3">
+                        <td className="min-w-[5rem] px-3 py-2 align-top">
                           <input
                             type="text"
                             value={item.banco || ""}
                             onChange={(e) =>
                               handleChange(item.id, "banco", e.target.value)
                             }
-                            className={`w-full bg-transparent font-mono text-xs focus:outline-none border-b border-transparent focus:border-blue-500 ${
+                            className={`w-full min-w-[4rem] bg-transparent font-mono text-xs focus:outline-none border-b border-transparent focus:border-blue-500 ${
                               item.classification === "A"
                                 ? "text-red-700"
                                 : item.classification === "B"
@@ -1361,13 +1361,13 @@ export default function ValidacaoOrcamento() {
                             placeholder="SINAPI"
                           />
                         </td>
-                        <td className="px-4 py-3">
+                        <td className="min-w-[4.5rem] px-3 py-2 align-top">
                           <select
                             value={item.tipo || "item"}
                             onChange={(e) =>
                               handleChange(item.id, "tipo", e.target.value)
                             }
-                            className={`w-full bg-transparent text-xs focus:outline-none border-b border-transparent focus:border-blue-500 ${
+                            className={`w-full min-w-[4rem] bg-transparent text-xs focus:outline-none border-b border-transparent focus:border-blue-500 ${
                               item.classification === "A"
                                 ? "text-red-700"
                                 : item.classification === "B"
@@ -1381,7 +1381,7 @@ export default function ValidacaoOrcamento() {
                             <option value="grupo">Grupo</option>
                           </select>
                         </td>
-                        <td className="px-2 py-3 text-center">
+                        <td className="w-12 px-2 py-2 text-center align-top">
                           {item.classification ? (
                             <span
                               className={`inline-flex items-center justify-center rounded-full px-2 py-0.5 text-xs font-bold ${
@@ -1399,7 +1399,7 @@ export default function ValidacaoOrcamento() {
                             <span className="text-slate-300">-</span>
                           )}
                         </td>
-                        <td className="px-4 py-3">
+                        <td className="min-w-[14rem] max-w-[24rem] px-3 py-2 align-top">
                           <input
                             type="text"
                             value={item.description}
@@ -1410,7 +1410,7 @@ export default function ValidacaoOrcamento() {
                                 e.target.value,
                               )
                             }
-                            className={`w-full bg-transparent text-sm focus:outline-none border-b border-transparent focus:border-blue-500 ${
+                            className={`w-full min-w-[12rem] bg-transparent text-sm leading-snug focus:outline-none border-b border-transparent focus:border-blue-500 ${
                               item.classification === "A"
                                 ? "text-red-900"
                                 : item.classification === "B"
@@ -1421,7 +1421,7 @@ export default function ValidacaoOrcamento() {
                             }`}
                           />
                         </td>
-                        <td className="px-3 py-3">
+                        <td className="min-w-[4.5rem] px-3 py-2 align-top">
                           {editable ? (
                             <input
                               type="number"
@@ -1432,7 +1432,7 @@ export default function ValidacaoOrcamento() {
                               onChange={(e) =>
                                 handleCellEdit(item.id, "bdi", e.target.value)
                               }
-                              className={EDITABLE_NUMERIC_CLASS}
+                              className={`${EDITABLE_NUMERIC_CLASS} min-w-[4rem]`}
                               placeholder="0,00"
                               aria-label={`BDI percentual do item ${item.code}`}
                             />
@@ -1440,14 +1440,14 @@ export default function ValidacaoOrcamento() {
                             <span className="block text-right text-sm text-slate-400">—</span>
                           )}
                         </td>
-                        <td className="px-2 py-3 text-center">
+                        <td className="w-14 px-2 py-2 text-center align-top">
                           <input
                             type="text"
                             value={item.unit}
                             onChange={(e) =>
                               handleChange(item.id, "unit", e.target.value)
                             }
-                            className={`w-full text-center rounded text-xs font-medium focus:outline-none focus:ring-1 focus:ring-blue-500 py-1 ${
+                            className={`w-full min-w-[2.5rem] text-center rounded text-xs font-medium focus:outline-none focus:ring-1 focus:ring-blue-500 py-1 ${
                               item.classification === "A"
                                 ? "bg-red-100 text-red-800"
                                 : item.classification === "B"
@@ -1458,7 +1458,7 @@ export default function ValidacaoOrcamento() {
                             }`}
                           />
                         </td>
-                        <td className="px-4 py-3">
+                        <td className="min-w-[5rem] px-3 py-2 align-top">
                           {editable ? (
                             <input
                               type="number"
@@ -1470,35 +1470,32 @@ export default function ValidacaoOrcamento() {
                                 handleCellEdit(item.id, "qty", e.target.value)
                               }
                               placeholder="0"
-                              className={EDITABLE_NUMERIC_CLASS}
+                              className={`${EDITABLE_NUMERIC_CLASS} min-w-[4.5rem]`}
                               aria-label={`Quantidade do item ${item.code}`}
                             />
                           ) : (
                             <span className="block text-right text-sm text-slate-400">—</span>
                           )}
                         </td>
-                        <td className="px-4 py-3">
+                        <td className="min-w-[6.5rem] px-3 py-2 align-top">
                           {editable ? (
-                            <div className="flex items-center justify-end gap-1">
-                              <span className="text-xs text-slate-400">R$</span>
-                              <input
-                                type="number"
-                                step="0.01"
-                                min={0}
-                                inputMode="decimal"
-                                value={item.unitPrice}
-                                onChange={(e) =>
-                                  handleCellEdit(item.id, "unitPrice", e.target.value)
-                                }
-                                className={`${EDITABLE_NUMERIC_CLASS} w-24`}
-                                aria-label={`Valor unitário s/ BDI do item ${item.code}`}
-                              />
-                            </div>
+                            <input
+                              type="number"
+                              step="0.01"
+                              min={0}
+                              inputMode="decimal"
+                              value={item.unitPrice}
+                              onChange={(e) =>
+                                handleCellEdit(item.id, "unitPrice", e.target.value)
+                              }
+                              className={`${EDITABLE_NUMERIC_CLASS} min-w-[5.5rem]`}
+                              aria-label={`Valor unitário s/ BDI do item ${item.code}`}
+                            />
                           ) : (
                             <span className="block text-right text-sm text-slate-400">—</span>
                           )}
                         </td>
-                        <td className={`px-4 py-3 text-right ${
+                        <td className={`min-w-[6.5rem] whitespace-nowrap px-3 py-2 text-right align-top ${
                           item.classification === "A"
                             ? "bg-red-100/50"
                             : item.classification === "B"
@@ -1519,7 +1516,7 @@ export default function ValidacaoOrcamento() {
                             {formatMoney(item.lineTotal)}
                           </span>
                         </td>
-                        <td className="px-4 py-3 text-right">
+                        <td className="min-w-[5.5rem] whitespace-nowrap px-3 py-2 text-right align-top">
                           {(() => {
                             const economia = calcularEconomia(item);
                             if (economia <= 0) {
@@ -1541,7 +1538,7 @@ export default function ValidacaoOrcamento() {
                             );
                           })()}
                         </td>
-                        <td className="px-2 py-3 text-center">
+                        <td className="w-10 px-1 py-2 text-center align-top">
                           <button
                             type="button"
                             onClick={() => setDeleteItemId(item.id)}

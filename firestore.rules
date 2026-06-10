@@ -14,6 +14,14 @@ service cloud.firestore {
         && resource.data.userId == request.auth.uid;
     }
 
+    // Metadados de upload de PDF (escrita via backend/admin SDK).
+    match /uploads/{docId} {
+      allow read: if request.auth != null
+        && resource.data.userId == request.auth.uid;
+
+      allow create, update, delete: if false;
+    }
+
     match /catalogo_produtos/{docId} {
       allow read: if request.auth != null
         && resource.data.userId == request.auth.uid;

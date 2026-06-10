@@ -16,7 +16,7 @@ import fitz
 import camelot
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from config import (
     FRONTEND_URLS,
@@ -65,6 +65,16 @@ from services.analitico_job import (
     get_job,
     init_job,
     make_progress_callback,
+)
+from services.analitico_queue import (
+    AnaliticoQueueJob,
+    enqueue_analitico_job,
+    get_queue_position,
+    start_queue_worker,
+)
+from services.storage_service import (
+    download_pdf_bytes_async,
+    upload_pdf_bytes_async,
 )
 from services.report_pdf import build_analysis_pdf_bytes
 from services.ai_audit_logger import log_ai_exchange
@@ -1199,6 +1209,84 @@ if FRONTEND_DIST.exists():
 else:
     logger.warning(f"⚠️  Frontend dist não encontrado: {FRONTEND_DIST}")
 
+async def _cloud_upload_pdf_background(
+    upload_id: str,
+    user_id: str,
+    pdf_bytes: bytes,
+    filename: str,
+    *,
+    size_bytes: int,
+) -> None:
+    """Envia PDF ao Firebase Storage e persiste URL nos metadados."""
+    try:
+        storage_url = await upload_pdf_bytes_async(
+            upload_id=upload_id,
+            user_id=user_id,
+            pdf_bytes=pdf_bytes,
+        )
+        if not storage_url:
+            return
+
+        meta = _load_upload_meta(upload_id)
+        meta["storageUrl"] = storage_url
+        meta["cloudUploadStatus"] = "completed"
+        _save_upload_meta(upload_id, meta)
+
+        try:
+            OrcamentoFirestore.save_upload_record(
+                user_id=user_id,
+                upload_id=upload_id,
+                filename=filename,
+                storage_url=storage_url,
+                size_bytes=size_bytes,
+            )
+        except Exception as exc:
+            logger.warning("Falha ao registrar upload no Firestore: %s", exc)
+    except Exception as exc:
+        logger.error("Upload em nuvem falhou para %s: %s", upload_id, exc)
+        meta = _load_upload_meta(upload_id)
+        meta["cloudUploadStatus"] = "failed"
+        _save_upload_meta(upload_id, meta)
+
+
+async def _resolve_pdf_bytes_for_upload(upload_id: str, user_id: str) -> bytes:
+    """Obtém bytes do PDF (disco local ou Firebase Storage)."""
+    file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
+    if file_path.is_file():
+        return file_path.read_bytes()
+
+    meta = _load_upload_meta(upload_id)
+    owner = meta.get("userId") or user_id
+    cloud_bytes = await download_pdf_bytes_async(upload_id=upload_id, user_id=owner)
+    if cloud_bytes:
+        try:
+            file_path.write_bytes(cloud_bytes)
+        except OSError as exc:
+            logger.warning("Não foi possível cachear PDF localmente: %s", exc)
+        return cloud_bytes
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"PDF não encontrado (local nem nuvem): {upload_id}",
+    )
+
+
+async def _process_queued_analitico_job(job: AnaliticoQueueJob) -> None:
+    pdf_bytes = await _resolve_pdf_bytes_for_upload(job.upload_id, job.user_id)
+    await _run_analitico_full_job(
+        job.upload_id,
+        job.user_id,
+        job.filename,
+        pdf_bytes,
+        force_reprocess=job.force_reprocess,
+    )
+
+
+@app.on_event("startup")
+async def _startup_analitico_queue() -> None:
+    start_queue_worker(_process_queued_analitico_job)
+
+
 # ============== HEALTH CHECK ==============
 @app.get("/health")
 async def health_check():
@@ -1417,16 +1505,28 @@ async def upload_pdf(
                 "userId": user_id,
                 "filename": file.filename,
                 "content_type": file.content_type,
+                "cloudUploadStatus": "pending",
             },
         )
-        
+
+        asyncio.create_task(
+            _cloud_upload_pdf_background(
+                upload_id,
+                user_id,
+                contents,
+                file.filename or f"{upload_id}.pdf",
+                size_bytes=len(contents),
+            )
+        )
+
         logger.info(f"✅ PDF salvo: {file_path} ({len(contents) / 1024 / 1024:.2f}MB)")
-        
+
         return {
             "status": "success",
             "upload_id": upload_id,
             "filename": file.filename,
             "size": len(contents),
+            "cloud_upload_status": "pending",
             "message": "✅ Arquivo recebido com sucesso",
         }
     
@@ -2034,8 +2134,26 @@ async def process_orcamento_confirmed(
 
 
 class ProcessAnaliticoFullRequest(BaseModel):
-    upload_id: str
+    upload_id: str | None = None
+    upload_ids: list[str] | None = None
     force_reprocess: bool = False
+
+    @model_validator(mode="after")
+    def _require_upload_ids(self) -> "ProcessAnaliticoFullRequest":
+        if not self.upload_id and not self.upload_ids:
+            raise ValueError("Informe upload_id ou upload_ids")
+        return self
+
+    def resolved_upload_ids(self) -> list[str]:
+        if self.upload_ids:
+            return self.upload_ids
+        if self.upload_id:
+            return [self.upload_id]
+        return []
+
+
+class AnaliticoBatchStatusRequest(BaseModel):
+    upload_ids: list[str] = Field(..., min_length=1)
 
 
 def _cached_analitico_payload(upload_id: str) -> Dict[str, Any] | None:
@@ -2075,6 +2193,7 @@ def _persist_analitico_result(
     filename: str,
     structured_data: Dict[str, Any],
     provider_used: str,
+    storage_url: str | None = None,
 ) -> Dict[str, Any]:
     hierarchical_items = structured_data.get("hierarchical_items") or []
     normalized_items = structured_data.get("items") or []
@@ -2088,6 +2207,9 @@ def _persist_analitico_result(
         "pages_meta": structured_data.get("pages_meta") or [],
     }
 
+    if not storage_url:
+        storage_url = (_load_upload_meta(upload_id) or {}).get("storageUrl")
+
     try:
         doc_id = OrcamentoFirestore.save_orcamento(
             user_id=user_id,
@@ -2100,6 +2222,7 @@ def _persist_analitico_result(
                 "resumo": combined_resumo,
             },
             ia_metadata=ia_metadata_final,
+            storage_url=storage_url,
         )
     except Exception as exc:
         logger.error("process-analitico-full: erro ao salvar no Firestore: %s", exc)
@@ -2154,12 +2277,14 @@ async def _run_analitico_full_job(
             filename=filename,
             progress_callback=make_progress_callback(upload_id),
         )
+        meta = _load_upload_meta(upload_id)
         result = _persist_analitico_result(
             upload_id=upload_id,
             user_id=user_id,
             filename=filename,
             structured_data=structured_data,
             provider_used=provider_used,
+            storage_url=meta.get("storageUrl"),
         )
         complete_job(upload_id, result)
     except OpenAIServiceError as exc:
@@ -2174,6 +2299,92 @@ async def _run_analitico_full_job(
         fail_job(upload_id, str(exc))
 
 
+def _build_analitico_job_status(upload_id: str) -> Dict[str, Any]:
+    """Monta resposta de status para um upload_id (job ativo, cache ou erro)."""
+    job = get_job(upload_id)
+    if job:
+        base = {
+            "upload_id": upload_id,
+            "status": job.get("status") or "processing",
+            "pages_total": job.get("pages_total") or 0,
+            "pages_done": job.get("pages_done") or 0,
+            "current_page": job.get("current_page"),
+            "message": job.get("message"),
+            "queue_position": job.get("queue_position") or get_queue_position(upload_id),
+        }
+        if job.get("status") == "completed" and job.get("result"):
+            return {**base, "status": "completed", "result": job["result"]}
+        if job.get("status") == "failed":
+            err_msg = job.get("error") or job.get("message") or "Erro desconhecido"
+            return {**base, "status": "failed", "error": err_msg}
+        return base
+
+    cached = _cached_analitico_payload(upload_id)
+    if cached:
+        return {
+            "upload_id": upload_id,
+            "status": "completed",
+            "message": "Resultado em cache",
+            "result": cached,
+            "pages_total": 0,
+            "pages_done": 0,
+            "queue_position": 0,
+        }
+    return {
+        "upload_id": upload_id,
+        "status": "not_found",
+        "message": "Nenhum processamento encontrado",
+        "pages_total": 0,
+        "pages_done": 0,
+        "queue_position": 0,
+    }
+
+
+def _enqueue_single_analitico(
+    upload_id: str,
+    user_id: str,
+    *,
+    force_reprocess: bool,
+) -> Dict[str, Any]:
+    upload_id = _validate_upload_id(upload_id)
+    file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
+    meta = _load_upload_meta(upload_id)
+    expected_user = meta.get("userId")
+    _assert_upload_access(user_id, expected_user)
+
+    if not file_path.is_file() and not meta.get("storageUrl"):
+        raise HTTPException(status_code=404, detail=f"Upload não encontrado: {upload_id}")
+
+    if not force_reprocess:
+        cached = _cached_analitico_payload(upload_id)
+        if cached:
+            return {**cached, "queue_position": 0}
+
+    existing = get_job(upload_id)
+    if existing and existing.get("status") in {"processing", "queued"}:
+        return _build_analitico_job_status(upload_id)
+
+    clear_job(upload_id)
+    filename = str(meta.get("filename") or f"{upload_id}.pdf")
+    position = enqueue_analitico_job(
+        AnaliticoQueueJob(
+            upload_id=upload_id,
+            user_id=user_id,
+            filename=filename,
+            force_reprocess=force_reprocess,
+        )
+    )
+    return {
+        "status": "processing",
+        "upload_id": upload_id,
+        "pages_total": 0,
+        "pages_done": 0,
+        "current_page": None,
+        "queue_position": position,
+        "message": f"Na fila de processamento (posição {position})…",
+    }
+
+
 @app.post("/api/orcamentos/process-analitico-full")
 async def process_analitico_full_pdf(
     payload: ProcessAnaliticoFullRequest,
@@ -2181,56 +2392,62 @@ async def process_analitico_full_pdf(
 ):
     """
     Inicia processamento do PDF inteiro para Orçamento Analítico.
-    Retorna imediatamente com status processing; use GET .../status para progresso.
-    Se já houver cache, retorna o resultado completo (status success).
+    Aceita upload_id (único) ou upload_ids (lote). Jobs entram em fila sequencial.
     """
-    upload_id = _validate_upload_id(payload.upload_id)
-    file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail=f"Upload não encontrado: {upload_id}")
+    upload_ids = [_validate_upload_id(uid) for uid in payload.resolved_upload_ids()]
+    if not upload_ids:
+        raise HTTPException(status_code=400, detail="Nenhum upload_id informado")
 
-    meta = _load_upload_meta(upload_id)
-    expected_user = meta.get("userId")
-    _assert_upload_access(user_id, expected_user)
-
-    if not payload.force_reprocess:
-        cached = _cached_analitico_payload(upload_id)
-        if cached:
-            return cached
-
-    existing = get_job(upload_id)
-    if existing and existing.get("status") == "processing":
-        return {
-            "status": "processing",
-            "upload_id": upload_id,
-            "pages_total": existing.get("pages_total") or 0,
-            "pages_done": existing.get("pages_done") or 0,
-            "current_page": existing.get("current_page"),
-            "message": existing.get("message") or "Análise em andamento…",
-        }
-
-    clear_job(upload_id)
-    init_job(upload_id)
-    filename = str(meta.get("filename") or file_path.name)
-    pdf_bytes = file_path.read_bytes()
-    asyncio.create_task(
-        _run_analitico_full_job(
-            upload_id,
+    if len(upload_ids) == 1:
+        result = _enqueue_single_analitico(
+            upload_ids[0],
             user_id,
-            filename,
-            pdf_bytes,
             force_reprocess=payload.force_reprocess,
         )
-    )
+        if result.get("status") == "success":
+            return result
+        return result
+
+    jobs: list[Dict[str, Any]] = []
+    for upload_id in upload_ids:
+        try:
+            job_status = _enqueue_single_analitico(
+                upload_id,
+                user_id,
+                force_reprocess=payload.force_reprocess,
+            )
+            jobs.append(job_status)
+        except HTTPException as exc:
+            jobs.append(
+                {
+                    "upload_id": upload_id,
+                    "status": "failed",
+                    "error": str(exc.detail),
+                    "message": str(exc.detail),
+                }
+            )
 
     return {
-        "status": "processing",
-        "upload_id": upload_id,
-        "pages_total": 0,
-        "pages_done": 0,
-        "current_page": None,
-        "message": "Iniciando análise do PDF…",
+        "status": "batch_accepted",
+        "jobs": jobs,
+        "message": f"{len(upload_ids)} arquivo(s) enfileirado(s) para processamento sequencial",
     }
+
+
+@app.post("/api/orcamentos/process-analitico-full/batch-status")
+async def process_analitico_full_batch_status(
+    payload: AnaliticoBatchStatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Consulta status de múltiplos jobs de processamento analítico."""
+    jobs: list[Dict[str, Any]] = []
+    for raw_id in payload.upload_ids:
+        upload_id = _validate_upload_id(raw_id)
+        meta = _load_upload_meta(upload_id)
+        expected_user = meta.get("userId")
+        _assert_upload_access(user_id, expected_user)
+        jobs.append(_build_analitico_job_status(upload_id))
+    return {"status": "success", "jobs": jobs}
 
 
 @app.get("/api/orcamentos/process-analitico-full/status/{upload_id}")
@@ -2244,52 +2461,19 @@ async def process_analitico_full_status(
     expected_user = meta.get("userId")
     _assert_upload_access(user_id, expected_user)
 
-    job = get_job(upload_id)
-    if job:
-        if job.get("status") == "completed" and job.get("result"):
-            return {
-                "status": "completed",
-                "upload_id": upload_id,
-                "pages_total": job.get("pages_total") or 0,
-                "pages_done": job.get("pages_done") or 0,
-                "message": job.get("message"),
-                "result": job["result"],
-            }
-        if job.get("status") == "failed":
-            err_msg = job.get("error") or job.get("message") or "Erro desconhecido"
-            logger.warning(
-                "process-analitico-full status failed upload_id=%s: %s",
-                upload_id,
-                err_msg,
-            )
-            return {
-                "status": "failed",
-                "upload_id": upload_id,
-                "error": err_msg,
-                "message": job.get("message") or err_msg,
-            }
-        return {
-            "status": "processing",
-            "upload_id": upload_id,
-            "pages_total": job.get("pages_total") or 0,
-            "pages_done": job.get("pages_done") or 0,
-            "current_page": job.get("current_page"),
-            "message": job.get("message") or "Processando…",
-        }
-
-    cached = _cached_analitico_payload(upload_id)
-    if cached:
-        return {
-            "status": "completed",
-            "upload_id": upload_id,
-            "message": "Resultado em cache",
-            "result": cached,
-        }
-
-    raise HTTPException(
-        status_code=404,
-        detail="Nenhum processamento em andamento para este upload.",
-    )
+    status_payload = _build_analitico_job_status(upload_id)
+    if status_payload.get("status") == "not_found":
+        raise HTTPException(
+            status_code=404,
+            detail="Nenhum processamento em andamento para este upload.",
+        )
+    if status_payload.get("status") == "failed":
+        logger.warning(
+            "process-analitico-full status failed upload_id=%s: %s",
+            upload_id,
+            status_payload.get("error"),
+        )
+    return status_payload
 
 
 # ============== ANALYZE WITH AI ==============
@@ -3372,25 +3556,28 @@ async def get_orcamento_pdf(
     upload_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Retorna o PDF original do upload, se ainda existir no servidor."""
+    """Retorna o PDF original do upload (disco local ou Firebase Storage)."""
+    upload_id = _validate_upload_id(upload_id)
+    meta = _load_upload_meta(upload_id)
+    owner = meta.get("userId")
+    _assert_upload_access(user_id, owner)
+
     file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
     if not file_path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="PDF não encontrado no servidor. Reenvie o arquivo se necessário.",
-        )
-    meta_path = _meta_path_for_upload_id(upload_id)
-    if meta_path.is_file():
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            owner = meta.get("userId")
-            _assert_upload_access(user_id, owner)
-        except json.JSONDecodeError:
-            pass
+            pdf_bytes = await _resolve_pdf_bytes_for_upload(upload_id, user_id)
+            file_path.write_bytes(pdf_bytes)
+        except HTTPException:
+            raise HTTPException(
+                status_code=404,
+                detail="PDF não encontrado no servidor. Reenvie o arquivo se necessário.",
+            ) from None
+
+    filename = str(meta.get("filename") or f"{upload_id}.pdf")
     return FileResponse(
         path=str(file_path),
         media_type="application/pdf",
-        filename=f"{upload_id}.pdf",
+        filename=filename,
     )
 
 

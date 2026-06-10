@@ -185,13 +185,23 @@ export type AnaliticoFullPdfResult = {
 };
 
 export type AnaliticoProgressUpdate = {
-  status: "processing" | "completed" | "failed";
+  status: "queued" | "processing" | "completed" | "failed";
   upload_id: string;
   pages_total: number;
   pages_done: number;
   current_page?: number | null;
+  queue_position?: number;
   message?: string;
   error?: string;
+  result?: AnaliticoFullPdfResult;
+};
+
+export type AnaliticoBatchJobStatus = AnaliticoProgressUpdate;
+
+export type AnaliticoBatchProcessResult = {
+  status: "batch_accepted";
+  jobs: AnaliticoBatchJobStatus[];
+  message: string;
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -271,7 +281,7 @@ export const processAnaliticoFullPdf = async (
         result?: AnaliticoFullPdfResult;
       };
 
-      if (statusData.status === "processing") {
+      if (statusData.status === "queued" || statusData.status === "processing") {
         options?.onProgress?.(statusData);
         continue;
       }
@@ -301,6 +311,80 @@ export const processAnaliticoFullPdf = async (
     }
   } catch (error: unknown) {
     rethrowAnaliticoProcessError(error, "Erro ao processar PDF completo");
+  }
+};
+
+/** Enfileira lote de PDFs para processamento analítico sequencial no backend. */
+export const startAnaliticoFullBatch = async (
+  uploadIds: string[],
+  options?: { forceReprocess?: boolean },
+): Promise<AnaliticoBatchProcessResult | AnaliticoFullPdfResult> => {
+  try {
+    const response = await apiClient.post(
+      "/api/orcamentos/process-analitico-full",
+      {
+        upload_ids: uploadIds,
+        force_reprocess: Boolean(options?.forceReprocess),
+      },
+      { timeout: 120000 },
+    );
+    return response.data;
+  } catch (error: unknown) {
+    rethrowAnaliticoProcessError(error, "Erro ao enfileirar lote de PDFs");
+  }
+};
+
+/** Consulta status de múltiplos jobs analíticos em uma única chamada. */
+export const getAnaliticoBatchStatus = async (
+  uploadIds: string[],
+): Promise<{ status: string; jobs: AnaliticoBatchJobStatus[] }> => {
+  try {
+    const response = await apiClient.post(
+      "/api/orcamentos/process-analitico-full/batch-status",
+      { upload_ids: uploadIds },
+      { timeout: 30000 },
+    );
+    return response.data;
+  } catch (error: unknown) {
+    rethrowAnaliticoProcessError(error, "Erro ao consultar status do lote");
+  }
+};
+
+/**
+ * Enfileira lote e faz polling até todos concluírem ou falharem.
+ * Retorna mapa uploadId → resultado (apenas jobs concluídos com sucesso).
+ */
+export const processAnaliticoFullBatch = async (
+  uploadIds: string[],
+  options?: {
+    forceReprocess?: boolean;
+    onProgress?: (jobs: AnaliticoBatchJobStatus[]) => void;
+    pollIntervalMs?: number;
+  },
+): Promise<Map<string, AnaliticoFullPdfResult>> => {
+  const pollIntervalMs = options?.pollIntervalMs ?? 1500;
+  await startAnaliticoFullBatch(uploadIds, { forceReprocess: options?.forceReprocess });
+
+  const results = new Map<string, AnaliticoFullPdfResult>();
+
+  for (;;) {
+    const { jobs } = await getAnaliticoBatchStatus(uploadIds);
+    options?.onProgress?.(jobs);
+
+    for (const job of jobs) {
+      if (job.status === "completed" && job.result && !results.has(job.upload_id)) {
+        results.set(job.upload_id, job.result);
+      }
+    }
+
+    const allDone = jobs.every(
+      (j) => j.status === "completed" || j.status === "failed",
+    );
+    if (allDone) {
+      return results;
+    }
+
+    await sleep(pollIntervalMs);
   }
 };
 

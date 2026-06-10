@@ -98,6 +98,12 @@ ENABLE_MULTI_PROVIDER_CHAIN = os.getenv(
     "ENABLE_MULTI_PROVIDER_CHAIN", _default_multi_provider_chain
 ).lower() in ("1", "true", "yes", "on")
 
+# Firebase Storage (PDFs originais)
+FIREBASE_STORAGE_BUCKET = os.getenv(
+    "FIREBASE_STORAGE_BUCKET",
+    "borderless-5a4c8.firebasestorage.app",
+)
+
 if GEMINI_API_KEY:
     print("GEMINI_API_KEY carregada")
 else:

@@ -16,14 +16,21 @@ def get_job(upload_id: str) -> Optional[Dict[str, Any]]:
     return _ANALITICO_JOBS.get(upload_id)
 
 
-def init_job(upload_id: str) -> Dict[str, Any]:
+def init_job(
+    upload_id: str,
+    *,
+    status: str = "processing",
+    message: str = "Iniciando análise…",
+    queue_position: int = 0,
+) -> Dict[str, Any]:
     job: Dict[str, Any] = {
-        "status": "processing",
+        "status": status,
         "upload_id": upload_id,
         "pages_total": 0,
         "pages_done": 0,
         "current_page": None,
-        "message": "Iniciando análise…",
+        "message": message,
+        "queue_position": queue_position,
         "result": None,
         "error": None,
         "cached": False,

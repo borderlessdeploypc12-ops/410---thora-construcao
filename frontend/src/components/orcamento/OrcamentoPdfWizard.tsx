@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useRef, useState } from "react";
 import { useDropzone, type DropzoneOptions } from "react-dropzone";
 import { AlertCircle, FileText, Loader2, UploadCloud, X } from "lucide-react";
 import { toast } from "sonner";
@@ -7,10 +7,18 @@ import { TableSelector, type MockTableOption } from "../TableSelector";
 import { WizardStepper, type WizardStep } from "../WizardStepper";
 import {
   detectOrcamentoTables,
+  processAnaliticoFullBatch,
   processAnaliticoFullPdf,
   processOrcamentoConfirmed,
   uploadPDF,
+  type AnaliticoBatchJobStatus,
+  type AnaliticoFullPdfResult,
 } from "../../services/api";
+import {
+  ProcessingQueuePanel,
+  type ProcessingQueueItem,
+  type QueueItemStatus,
+} from "./ProcessingQueuePanel";
 
 export type OrcamentoWizardResult = {
   uploadId: string;
@@ -38,6 +46,8 @@ type FlowPhase =
 
 type WizardMode = "table_selection" | "full_pdf";
 
+const MAX_FULL_PDF_FILES = 20;
+
 function getWizardStep(phase: FlowPhase, mode: WizardMode): number {
   if (mode === "full_pdf") {
     switch (phase) {
@@ -64,6 +74,39 @@ function getWizardStep(phase: FlowPhase, mode: WizardMode): number {
   }
 }
 
+function mapJobToQueueItem(
+  job: AnaliticoBatchJobStatus,
+  filename: string,
+): ProcessingQueueItem {
+  const isWaitingInQueue =
+    (job.status === "queued" ||
+      (job.status === "processing" &&
+        (job.queue_position ?? 0) > 0 &&
+        (job.pages_total ?? 0) === 0));
+
+  const status: QueueItemStatus = isWaitingInQueue
+    ? "queued"
+    : job.status === "processing"
+      ? "processing"
+      : job.status === "completed"
+        ? "completed"
+        : job.status === "failed"
+          ? "failed"
+          : "processing";
+
+  return {
+    uploadId: job.upload_id,
+    filename,
+    status,
+    pagesTotal: job.pages_total,
+    pagesDone: job.pages_done,
+    currentPage: job.current_page,
+    queuePosition: job.queue_position,
+    message: job.message,
+    error: job.error,
+  };
+}
+
 type OrcamentoPdfWizardProps = {
   steps: WizardStep[];
   title: string;
@@ -84,7 +127,8 @@ export function OrcamentoPdfWizard({
   onComplete,
 }: OrcamentoPdfWizardProps) {
   const isFullPdf = mode === "full_pdf";
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
+  const file = files[0] ?? null;
   const [phase, setPhase] = useState<FlowPhase>("pick_file");
   const [uploadId, setUploadId] = useState<string | null>(null);
   const [tableOptions, setTableOptions] = useState<MockTableOption[]>([]);
@@ -92,10 +136,35 @@ export function OrcamentoPdfWizard({
   const [errorMessage, setErrorMessage] = useState("");
   const [processingDetail, setProcessingDetail] = useState("");
   const [progressPercent, setProgressPercent] = useState(0);
+  const [queueItems, setQueueItems] = useState<ProcessingQueueItem[]>([]);
+  const [batchFileMap, setBatchFileMap] = useState<Map<string, File>>(new Map());
+  const [batchResults, setBatchResults] = useState<Map<string, AnaliticoFullPdfResult>>(
+    new Map(),
+  );
+  const [selectedQueueId, setSelectedQueueId] = useState<string | null>(null);
+  const autoOpenedRef = useRef<string | null>(null);
 
-  const onDrop = useCallback((acceptedFiles: File[]) => {
-    if (acceptedFiles.length > 0) {
-      setFile(acceptedFiles[0]);
+  const resetFlow = useCallback(() => {
+    setFiles([]);
+    setUploadId(null);
+    setTableOptions([]);
+    setSelectedTableIds([]);
+    setErrorMessage("");
+    setProcessingDetail("");
+    setProgressPercent(0);
+    setQueueItems([]);
+    setBatchFileMap(new Map());
+    setBatchResults(new Map());
+    setSelectedQueueId(null);
+    autoOpenedRef.current = null;
+    setPhase("pick_file");
+  }, []);
+
+  const onDrop = useCallback(
+    (acceptedFiles: File[]) => {
+      if (acceptedFiles.length === 0) return;
+      const nextFiles = isFullPdf ? acceptedFiles : [acceptedFiles[0]];
+      setFiles(nextFiles);
       setPhase("pick_file");
       setUploadId(null);
       setTableOptions([]);
@@ -103,26 +172,38 @@ export function OrcamentoPdfWizard({
       setErrorMessage("");
       setProcessingDetail("");
       setProgressPercent(0);
-    }
-  }, []);
+      setQueueItems([]);
+      setBatchFileMap(new Map());
+      setBatchResults(new Map());
+      setSelectedQueueId(null);
+    },
+    [isFullPdf],
+  );
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: { "application/pdf": [".pdf"] },
-    maxFiles: 1,
-    multiple: false,
+    maxFiles: isFullPdf ? MAX_FULL_PDF_FILES : 1,
+    multiple: isFullPdf,
   } as unknown as DropzoneOptions);
 
-  const removeFile = (e: React.MouseEvent) => {
+  const removeFile = (index: number, e: React.MouseEvent) => {
     e.stopPropagation();
-    setFile(null);
+    const next = files.filter((_, i) => i !== index);
+    if (next.length === 0) {
+      resetFlow();
+      return;
+    }
+    setFiles(next);
+    setPhase("pick_file");
     setUploadId(null);
-    setTableOptions([]);
-    setSelectedTableIds([]);
     setErrorMessage("");
     setProcessingDetail("");
     setProgressPercent(0);
-    setPhase("pick_file");
+    setQueueItems([]);
+    setBatchFileMap(new Map());
+    setBatchResults(new Map());
+    setSelectedQueueId(null);
   };
 
   const finishWithResult = async (
@@ -136,6 +217,7 @@ export function OrcamentoPdfWizard({
       ia_metadata?: unknown;
       upload_id?: string;
     },
+    sourceFile: File,
     tableIds: string[] = [],
     previews: OrcamentoWizardResult["selectedTablePreviews"] = [],
   ) => {
@@ -145,7 +227,7 @@ export function OrcamentoPdfWizard({
 
     await onComplete({
       uploadId: (result.upload_id as string) ?? currentUploadId,
-      file: file!,
+      file: sourceFile,
       selectedTableIds: tableIds,
       selectedTablePreviews: previews,
       extractedData: result.tables ?? [],
@@ -156,20 +238,40 @@ export function OrcamentoPdfWizard({
     });
   };
 
+  const handleQueueSelect = async (item: ProcessingQueueItem) => {
+    const result = batchResults.get(item.uploadId);
+    const sourceFile = batchFileMap.get(item.uploadId);
+    if (!result || !sourceFile) return;
+    setSelectedQueueId(item.uploadId);
+    await finishWithResult(item.uploadId, result, sourceFile);
+  };
+
   const handleFullPdfFlow = async () => {
-    if (!file) return;
+    if (files.length === 0) return;
+
+    if (files.length === 1) {
+      await handleSingleFullPdfFlow(files[0]);
+      return;
+    }
+
+    await handleBatchFullPdfFlow(files);
+  };
+
+  const handleSingleFullPdfFlow = async (singleFile: File) => {
     setErrorMessage("");
     setProcessingDetail("");
     setProgressPercent(0);
 
     try {
       setPhase("uploading");
-      const uploadResponse = await uploadPDF(file);
+      const uploadResponse = await uploadPDF(singleFile);
       const currentUploadId = uploadResponse.upload_id as string;
       setUploadId(currentUploadId);
 
       setPhase("processing_ai");
-      setProcessingDetail("Identificando páginas com quantidades e valores (texto, tabela ou imagem)…");
+      setProcessingDetail(
+        "Identificando páginas com quantidades e valores (texto, tabela ou imagem)…",
+      );
       setProgressPercent(2);
       console.info(`[${logTag}] Processamento integral do PDF:`, currentUploadId);
 
@@ -178,6 +280,14 @@ export function OrcamentoPdfWizard({
         onProgress: (update) => {
           const total = update.pages_total || 0;
           const done = update.pages_done || 0;
+          if (update.status === "queued") {
+            setProcessingDetail(
+              update.message ??
+                `Na fila de processamento${update.queue_position ? ` (#${update.queue_position})` : ""}…`,
+            );
+            setProgressPercent((prev) => Math.max(prev, 3));
+            return;
+          }
           if (total > 0) {
             const pct = Math.min(98, Math.round((done / total) * 100));
             setProgressPercent(pct);
@@ -200,13 +310,119 @@ export function OrcamentoPdfWizard({
             ? `${pages} página(s) analisadas — montando planilha hierárquica…`
             : "Montando planilha hierárquica…",
       );
-      await finishWithResult(currentUploadId, result);
+      await finishWithResult(currentUploadId, result, singleFile);
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : "Erro ao processar arquivo";
       console.error(`[${logTag}] Falha no processamento integral:`, error);
       setErrorMessage(msg);
       setPhase("pick_file");
       toast.error("Falha no processamento", { description: msg });
+    }
+  };
+
+  const handleBatchFullPdfFlow = async (pdfFiles: File[]) => {
+    setErrorMessage("");
+    setProcessingDetail("");
+    setProgressPercent(0);
+
+    const initialQueue: ProcessingQueueItem[] = pdfFiles.map((f, index) => ({
+      uploadId: `pending-${index}`,
+      filename: f.name,
+      status: "uploading",
+      message: "Enviando arquivo…",
+    }));
+    setQueueItems(initialQueue);
+
+    try {
+      setPhase("uploading");
+
+      const uploadResults = await Promise.all(
+        pdfFiles.map(async (pdfFile, index) => {
+          const response = await uploadPDF(pdfFile);
+          return {
+            uploadId: response.upload_id as string,
+            file: pdfFile,
+            index,
+          };
+        }),
+      );
+
+      const fileMap = new Map<string, File>();
+      const nameMap = new Map<string, string>();
+      for (const item of uploadResults) {
+        fileMap.set(item.uploadId, item.file);
+        nameMap.set(item.uploadId, item.file.name);
+      }
+      setBatchFileMap(fileMap);
+
+      setQueueItems(
+        uploadResults.map((item) => ({
+          uploadId: item.uploadId,
+          filename: item.file.name,
+          status: "queued",
+          message: "Aguardando processamento…",
+        })),
+      );
+
+      setPhase("processing_ai");
+      setProcessingDetail(`${pdfFiles.length} arquivo(s) enfileirados — processamento sequencial…`);
+
+      const resultsMap = await processAnaliticoFullBatch(
+        uploadResults.map((r) => r.uploadId),
+        {
+          forceReprocess: true,
+          onProgress: (jobs) => {
+            setQueueItems(
+              jobs.map((job) =>
+                mapJobToQueueItem(job, nameMap.get(job.upload_id) ?? job.upload_id),
+              ),
+            );
+
+            const partialResults = new Map<string, AnaliticoFullPdfResult>();
+            for (const job of jobs) {
+              if (job.status === "completed" && job.result) {
+                partialResults.set(job.upload_id, job.result);
+              }
+            }
+            if (partialResults.size > 0) {
+              setBatchResults((prev) => new Map([...prev, ...partialResults]));
+
+              const firstCompleted = uploadResults.find((r) => partialResults.has(r.uploadId));
+              if (firstCompleted && !autoOpenedRef.current) {
+                const result = partialResults.get(firstCompleted.uploadId)!;
+                autoOpenedRef.current = firstCompleted.uploadId;
+                setSelectedQueueId(firstCompleted.uploadId);
+                setProcessingDetail("Primeiro resultado pronto — abrindo planilha…");
+                void finishWithResult(
+                  firstCompleted.uploadId,
+                  result,
+                  firstCompleted.file,
+                );
+              }
+            }
+          },
+        },
+      );
+
+      setBatchResults(resultsMap);
+
+      const failedJobs = uploadResults.filter((r) => !resultsMap.has(r.uploadId));
+      if (failedJobs.length > 0) {
+        toast.warning(`${failedJobs.length} arquivo(s) falharam no processamento`);
+      }
+
+      if (resultsMap.size === 0) {
+        throw new Error("Nenhum arquivo foi processado com sucesso.");
+      }
+
+      setProgressPercent(100);
+      setProcessingDetail("Análise do lote concluída.");
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : "Erro ao processar lote";
+      console.error(`[${logTag}] Falha no lote:`, error);
+      setErrorMessage(msg);
+      setPhase("pick_file");
+      toast.error("Falha no processamento em lote", { description: msg });
     }
   };
 
@@ -295,7 +511,7 @@ export function OrcamentoPdfWizard({
           imagem_base64: t.imagem_base64,
         }));
 
-      await finishWithResult(uploadId, result, selectedTableIds, selectedTablePreviews);
+      await finishWithResult(uploadId, result, file, selectedTableIds, selectedTablePreviews);
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : "Erro ao processar com IA";
       setErrorMessage(msg);
@@ -312,9 +528,11 @@ export function OrcamentoPdfWizard({
   const wizardStep = getWizardStep(phase, mode);
   const canRemoveFile =
     phase === "pick_file" || phase === "selecting_table" || (isFullPdf && phase === "uploading");
+  const showQueuePanel = isFullPdf && queueItems.length > 0;
+  const isMultiBatch = isFullPdf && files.length > 1;
 
   return (
-    <div className="mx-auto w-full max-w-5xl">
+    <div className="mx-auto w-full max-w-6xl">
       <header className="mb-5">
         <h1 className="text-xl font-bold text-slate-900 sm:text-2xl">{title}</h1>
         <p className="mt-1 text-sm text-slate-600">{subtitle}</p>
@@ -322,130 +540,158 @@ export function OrcamentoPdfWizard({
 
       <WizardStepper steps={steps} currentStep={wizardStep} className="mb-6" />
 
-      {!file ? (
-        <div
-          {...getRootProps()}
-          className={`mt-4 w-full cursor-pointer rounded-xl border-2 border-dashed p-10 text-center transition duration-200 ${
-            isDragActive
-              ? "border-blue-500 bg-blue-50"
-              : "border-blue-200 bg-white hover:border-blue-400 hover:bg-blue-50/30"
-          }`}
-          aria-label="Área para selecionar arquivo PDF"
-        >
-          <input {...(getInputProps() as React.InputHTMLAttributes<HTMLInputElement>)} />
+      <div className={`flex flex-col gap-6 ${showQueuePanel ? "lg:flex-row lg:items-start" : ""}`}>
+        <div className="min-w-0 flex-1">
+          {files.length === 0 ? (
+            <div
+              {...getRootProps()}
+              className={`mt-4 w-full cursor-pointer rounded-xl border-2 border-dashed p-10 text-center transition duration-200 ${
+                isDragActive
+                  ? "border-blue-500 bg-blue-50"
+                  : "border-blue-200 bg-white hover:border-blue-400 hover:bg-blue-50/30"
+              }`}
+              aria-label="Área para selecionar arquivo PDF"
+            >
+              <input {...(getInputProps() as React.InputHTMLAttributes<HTMLInputElement>)} />
 
-          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-blue-50">
-            <UploadCloud
-              className={`h-7 w-7 ${isDragActive ? "text-blue-600" : "text-blue-500"}`}
-              aria-hidden="true"
-            />
-          </div>
+              <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-blue-50">
+                <UploadCloud
+                  className={`h-7 w-7 ${isDragActive ? "text-blue-600" : "text-blue-500"}`}
+                  aria-hidden="true"
+                />
+              </div>
 
-          <p className="text-lg font-medium text-slate-800">
-            {isDragActive ? "Pode soltar o arquivo agora" : "Arraste e solte seu PDF ou edital"}
-          </p>
-          <p className="text-sm text-slate-500">ou clique para selecionar</p>
-          <p className="mt-2 text-xs text-slate-400">
-            {isFullPdf
-              ? "A IA lê planilhas e também trechos em texto do edital com quantidades e valores"
-              : "Suporta arquivos PDF de até 50MB"}
-          </p>
-        </div>
-      ) : (
-        <div className="mt-4 flex w-full flex-col items-stretch">
-          <div className="relative w-full overflow-hidden rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-            <div className="flex items-center gap-4">
-              <div className="rounded-lg bg-red-50 p-3" aria-hidden="true">
-                <FileText className="h-8 w-8 text-red-500" />
+              <p className="text-lg font-medium text-slate-800">
+                {isDragActive
+                  ? "Pode soltar os arquivos agora"
+                  : isFullPdf
+                    ? "Arraste e solte um ou vários PDFs/editais"
+                    : "Arraste e solte seu PDF ou edital"}
+              </p>
+              <p className="text-sm text-slate-500">ou clique para selecionar</p>
+              <p className="mt-2 text-xs text-slate-400">
+                {isFullPdf
+                  ? `Até ${MAX_FULL_PDF_FILES} arquivos — processamento sequencial em fila`
+                  : "Suporta arquivos PDF de até 50MB"}
+              </p>
+            </div>
+          ) : (
+            <div className="mt-4 flex w-full flex-col items-stretch">
+              <div className="relative w-full overflow-hidden rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+                <div className="space-y-3">
+                  {files.map((f, index) => (
+                    <div key={`${f.name}-${index}`} className="flex items-center gap-4">
+                      <div className="rounded-lg bg-red-50 p-3" aria-hidden="true">
+                        <FileText className="h-8 w-8 text-red-500" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-medium text-slate-900">{f.name}</p>
+                        <p className="text-sm text-slate-500">
+                          {(f.size / 1024 / 1024).toFixed(2)} MB
+                        </p>
+                      </div>
+                      {canRemoveFile && (
+                        <button
+                          type="button"
+                          onClick={(e) => removeFile(index, e)}
+                          className="rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-red-600"
+                          aria-label={`Remover ${f.name}`}
+                        >
+                          <X className="h-5 w-5" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+
+                {showUploadProgress && !isMultiBatch && (
+                  <div className="mt-4 border-t border-slate-100 pt-4" role="status" aria-live="polite">
+                    <div className="mb-2 flex items-center gap-2 text-sm font-medium text-blue-600">
+                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                      {phase === "uploading" ? "Enviando arquivo…" : "Detectando tabelas…"}
+                    </div>
+                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+                      <div
+                        className={`h-full rounded-full bg-blue-600 ${
+                          phase === "uploading" ? "w-1/3 animate-pulse" : "w-2/3 animate-pulse"
+                        }`}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {phase === "processing_ai" && !isMultiBatch && (
+                  <div className="mt-4 border-t border-slate-100 pt-4" role="status" aria-live="polite">
+                    <div className="mb-2 flex items-center gap-2 text-sm font-medium text-violet-700">
+                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                      {processingLabel}
+                    </div>
+                    {processingDetail ? (
+                      <p className="mb-2 text-xs text-slate-500">{processingDetail}</p>
+                    ) : null}
+                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+                      <div
+                        className="h-full rounded-full bg-blue-600 transition-all duration-500 ease-out"
+                        style={{ width: `${Math.max(progressPercent, 3)}%` }}
+                      />
+                    </div>
+                    {progressPercent > 0 ? (
+                      <p className="mt-1 text-right text-xs text-slate-400">{progressPercent}%</p>
+                    ) : null}
+                  </div>
+                )}
+
+                {phase === "processing_ai" && isMultiBatch && processingDetail ? (
+                  <p className="mt-4 border-t border-slate-100 pt-4 text-xs text-slate-500">
+                    {processingDetail}
+                  </p>
+                ) : null}
+
+                {errorMessage && (
+                  <div className="mt-3 flex gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                    <span>{errorMessage}</span>
+                  </div>
+                )}
               </div>
-              <div className="min-w-0 flex-1">
-                <p className="truncate font-medium text-slate-900">{file.name}</p>
-                <p className="text-sm text-slate-500">
-                  {(file.size / 1024 / 1024).toFixed(2)} MB
-                </p>
-              </div>
-              {canRemoveFile && (
+
+              {phase === "pick_file" && (
                 <button
                   type="button"
-                  onClick={removeFile}
-                  className="rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-red-600"
-                  aria-label="Remover arquivo selecionado"
+                  onClick={() => void handleStartFlow()}
+                  className={`${btnPrimary} mt-6 w-full py-3`}
                 >
-                  <X className="h-5 w-5" />
+                  {isFullPdf
+                    ? files.length > 1
+                      ? `Enviar e analisar ${files.length} documentos`
+                      : "Enviar e analisar documento completo"
+                    : "Enviar e escolher tabela"}
                 </button>
               )}
+
+              {showTablePhase && (
+                <TableSelector
+                  tables={tableOptions}
+                  loading={phase === "uploading" || phase === "detecting"}
+                  disabled={phase === "processing_ai"}
+                  selectedIds={selectedTableIds}
+                  onSelect={handleSelectTable}
+                  onConfirm={() => void handleConfirmSelection()}
+                  confirmLabel="Analisar com IA"
+                />
+              )}
             </div>
-
-            {showUploadProgress && (
-              <div className="mt-4 border-t border-slate-100 pt-4" role="status" aria-live="polite">
-                <div className="mb-2 flex items-center gap-2 text-sm font-medium text-blue-600">
-                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                  {phase === "uploading"
-                    ? "Enviando arquivo…"
-                    : "Detectando tabelas…"}
-                </div>
-                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
-                  <div
-                    className={`h-full rounded-full bg-blue-600 ${
-                      phase === "uploading" ? "w-1/3 animate-pulse" : "w-2/3 animate-pulse"
-                    }`}
-                  />
-                </div>
-              </div>
-            )}
-
-            {phase === "processing_ai" && (
-              <div className="mt-4 border-t border-slate-100 pt-4" role="status" aria-live="polite">
-                <div className="mb-2 flex items-center gap-2 text-sm font-medium text-violet-700">
-                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                  {processingLabel}
-                </div>
-                {processingDetail ? (
-                  <p className="mb-2 text-xs text-slate-500">{processingDetail}</p>
-                ) : null}
-                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
-                  <div
-                    className="h-full rounded-full bg-blue-600 transition-all duration-500 ease-out"
-                    style={{ width: `${Math.max(progressPercent, 3)}%` }}
-                  />
-                </div>
-                {progressPercent > 0 ? (
-                  <p className="mt-1 text-right text-xs text-slate-400">{progressPercent}%</p>
-                ) : null}
-              </div>
-            )}
-
-            {errorMessage && (
-              <div className="mt-3 flex gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
-                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-                <span>{errorMessage}</span>
-              </div>
-            )}
-          </div>
-
-          {phase === "pick_file" && (
-            <button
-              type="button"
-              onClick={() => void handleStartFlow()}
-              className={`${btnPrimary} mt-6 w-full py-3`}
-            >
-              {isFullPdf ? "Enviar e analisar documento completo" : "Enviar e escolher tabela"}
-            </button>
-          )}
-
-          {showTablePhase && (
-            <TableSelector
-              tables={tableOptions}
-              loading={phase === "uploading" || phase === "detecting"}
-              disabled={phase === "processing_ai"}
-              selectedIds={selectedTableIds}
-              onSelect={handleSelectTable}
-              onConfirm={() => void handleConfirmSelection()}
-              confirmLabel="Analisar com IA"
-            />
           )}
         </div>
-      )}
+
+        {showQueuePanel ? (
+          <ProcessingQueuePanel
+            items={queueItems}
+            selectedUploadId={selectedQueueId}
+            onSelectCompleted={(item) => void handleQueueSelect(item)}
+          />
+        ) : null}
+      </div>
     </div>
   );
 }
