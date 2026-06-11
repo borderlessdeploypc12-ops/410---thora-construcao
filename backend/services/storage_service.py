@@ -16,6 +16,11 @@ _bucket = None
 _storage_disabled = False
 
 
+def is_storage_available() -> bool:
+    """Indica se o Firebase Storage está configurado e acessível."""
+    return _get_bucket() is not None
+
+
 def _get_bucket():
     global _bucket, _storage_disabled
     if _storage_disabled:

@@ -14,7 +14,6 @@ import {
   Loader2,
   Download,
   CheckCircle2,
-  Layers,
   LayoutList,
   FileSpreadsheet,
 } from "lucide-react";
@@ -896,25 +895,6 @@ export default function ValidacaoOrcamento() {
           >
             <CheckCircle2 className="h-4 w-4" />
             {isSaving ? "Salvando…" : "Finalizar"}
-          </button>
-          <button
-            type="button"
-            disabled={isLoading || hierarchicalItems.length === 0}
-            className={`${btnMuted} shrink-0`}
-            onClick={() => {
-              const id = resolvedUploadId || "unknown";
-              navigate(`/orcamento-analitico/${id}`, {
-                state: {
-                  ...flowState,
-                  uploadId: id,
-                  hierarchicalItems,
-                },
-              });
-            }}
-            title="Ver orçamento na estrutura hierárquica do edital"
-          >
-            <Layers className="h-4 w-4" />
-            Orçamento Analítico
           </button>
           <button
             type="button"

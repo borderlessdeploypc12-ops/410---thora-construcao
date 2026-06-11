@@ -46,7 +46,7 @@ type FlowPhase =
 
 type WizardMode = "table_selection" | "full_pdf";
 
-const MAX_FULL_PDF_FILES = 20;
+const MAX_BATCH_PDF_FILES = 20;
 
 function getWizardStep(phase: FlowPhase, mode: WizardMode): number {
   if (mode === "full_pdf") {
@@ -114,6 +114,8 @@ type OrcamentoPdfWizardProps = {
   processingLabel: string;
   logTag?: string;
   mode?: WizardMode;
+  enableMultiUpload?: boolean;
+  onBatchUpload?: (files: File[]) => void | Promise<void>;
   onComplete: (result: OrcamentoWizardResult) => void | Promise<void>;
 };
 
@@ -124,9 +126,12 @@ export function OrcamentoPdfWizard({
   processingLabel,
   logTag = "Orçamento",
   mode = "table_selection",
+  enableMultiUpload = false,
+  onBatchUpload,
   onComplete,
 }: OrcamentoPdfWizardProps) {
   const isFullPdf = mode === "full_pdf";
+  const allowsMultiple = isFullPdf || enableMultiUpload;
   const [files, setFiles] = useState<File[]>([]);
   const file = files[0] ?? null;
   const [phase, setPhase] = useState<FlowPhase>("pick_file");
@@ -163,7 +168,7 @@ export function OrcamentoPdfWizard({
   const onDrop = useCallback(
     (acceptedFiles: File[]) => {
       if (acceptedFiles.length === 0) return;
-      const nextFiles = isFullPdf ? acceptedFiles : [acceptedFiles[0]];
+      const nextFiles = allowsMultiple ? acceptedFiles : [acceptedFiles[0]];
       setFiles(nextFiles);
       setPhase("pick_file");
       setUploadId(null);
@@ -177,14 +182,14 @@ export function OrcamentoPdfWizard({
       setBatchResults(new Map());
       setSelectedQueueId(null);
     },
-    [isFullPdf],
+    [allowsMultiple],
   );
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: { "application/pdf": [".pdf"] },
-    maxFiles: isFullPdf ? MAX_FULL_PDF_FILES : 1,
-    multiple: isFullPdf,
+    maxFiles: allowsMultiple ? MAX_BATCH_PDF_FILES : 1,
+    multiple: allowsMultiple,
   } as unknown as DropzoneOptions);
 
   const removeFile = (index: number, e: React.MouseEvent) => {
@@ -262,22 +267,45 @@ export function OrcamentoPdfWizard({
     setProcessingDetail("");
     setProgressPercent(0);
 
+    setQueueItems([
+      {
+        uploadId: "pending-0",
+        filename: singleFile.name,
+        status: "uploading",
+        message: "Enviando arquivo…",
+      },
+    ]);
+
     try {
       setPhase("uploading");
       const uploadResponse = await uploadPDF(singleFile);
       const currentUploadId = uploadResponse.upload_id as string;
       setUploadId(currentUploadId);
+      setBatchFileMap(new Map([[currentUploadId, singleFile]]));
+
+      setQueueItems([
+        {
+          uploadId: currentUploadId,
+          filename: singleFile.name,
+          status: "queued",
+          message: "Aguardando processamento…",
+        },
+      ]);
 
       setPhase("processing_ai");
-      setProcessingDetail(
-        "Identificando páginas com quantidades e valores (texto, tabela ou imagem)…",
-      );
-      setProgressPercent(2);
+      setProcessingDetail("Documento enfileirado — processamento sequencial…");
       console.info(`[${logTag}] Processamento integral do PDF:`, currentUploadId);
 
       const result = await processAnaliticoFullPdf(currentUploadId, {
         forceReprocess: true,
         onProgress: (update) => {
+          setQueueItems([
+            mapJobToQueueItem(
+              { ...update, upload_id: currentUploadId },
+              singleFile.name,
+            ),
+          ]);
+
           const total = update.pages_total || 0;
           const done = update.pages_done || 0;
           if (update.status === "queued") {
@@ -285,23 +313,22 @@ export function OrcamentoPdfWizard({
               update.message ??
                 `Na fila de processamento${update.queue_position ? ` (#${update.queue_position})` : ""}…`,
             );
-            setProgressPercent((prev) => Math.max(prev, 3));
             return;
           }
           if (total > 0) {
-            const pct = Math.min(98, Math.round((done / total) * 100));
-            setProgressPercent(pct);
             setProcessingDetail(
               update.message ??
                 `Analisando página ${update.current_page ?? done} (${done}/${total})…`,
             );
           } else if (update.message) {
             setProcessingDetail(update.message);
-            setProgressPercent((prev) => Math.max(prev, 5));
           }
         },
       });
-      setProgressPercent(100);
+
+      setBatchResults(new Map([[currentUploadId, result]]));
+      setSelectedQueueId(currentUploadId);
+
       const pages = (result.resumo?.paginas_processadas as number | undefined) ?? 0;
       setProcessingDetail(
         result.cached
@@ -316,6 +343,13 @@ export function OrcamentoPdfWizard({
       console.error(`[${logTag}] Falha no processamento integral:`, error);
       setErrorMessage(msg);
       setPhase("pick_file");
+      setQueueItems((prev) =>
+        prev.map((item) =>
+          item.uploadId.startsWith("pending-")
+            ? item
+            : { ...item, status: "failed" as const, error: msg },
+        ),
+      );
       toast.error("Falha no processamento", { description: msg });
     }
   };
@@ -473,6 +507,10 @@ export function OrcamentoPdfWizard({
   };
 
   const handleStartFlow = () => {
+    if (enableMultiUpload && !isFullPdf && files.length > 1) {
+      void onBatchUpload?.(files);
+      return;
+    }
     if (isFullPdf) {
       void handleFullPdfFlow();
     } else {
@@ -529,7 +567,6 @@ export function OrcamentoPdfWizard({
   const canRemoveFile =
     phase === "pick_file" || phase === "selecting_table" || (isFullPdf && phase === "uploading");
   const showQueuePanel = isFullPdf && queueItems.length > 0;
-  const isMultiBatch = isFullPdf && files.length > 1;
 
   return (
     <div className="mx-auto w-full max-w-6xl">
@@ -564,14 +601,16 @@ export function OrcamentoPdfWizard({
               <p className="text-lg font-medium text-slate-800">
                 {isDragActive
                   ? "Pode soltar os arquivos agora"
-                  : isFullPdf
+                  : allowsMultiple
                     ? "Arraste e solte um ou vários PDFs/editais"
                     : "Arraste e solte seu PDF ou edital"}
               </p>
               <p className="text-sm text-slate-500">ou clique para selecionar</p>
               <p className="mt-2 text-xs text-slate-400">
-                {isFullPdf
-                  ? `Até ${MAX_FULL_PDF_FILES} arquivos — processamento sequencial em fila`
+                {allowsMultiple
+                  ? enableMultiUpload && !isFullPdf
+                    ? `Até ${MAX_BATCH_PDF_FILES} arquivos — lotes vão para a Lista de análises`
+                    : `Até ${MAX_BATCH_PDF_FILES} arquivos — processamento sequencial em fila`
                   : "Suporta arquivos PDF de até 50MB"}
               </p>
             </div>
@@ -604,7 +643,7 @@ export function OrcamentoPdfWizard({
                   ))}
                 </div>
 
-                {showUploadProgress && !isMultiBatch && (
+                {showUploadProgress && !showQueuePanel && (
                   <div className="mt-4 border-t border-slate-100 pt-4" role="status" aria-live="polite">
                     <div className="mb-2 flex items-center gap-2 text-sm font-medium text-blue-600">
                       <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
@@ -620,7 +659,7 @@ export function OrcamentoPdfWizard({
                   </div>
                 )}
 
-                {phase === "processing_ai" && !isMultiBatch && (
+                {phase === "processing_ai" && !showQueuePanel && (
                   <div className="mt-4 border-t border-slate-100 pt-4" role="status" aria-live="polite">
                     <div className="mb-2 flex items-center gap-2 text-sm font-medium text-violet-700">
                       <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
@@ -641,7 +680,7 @@ export function OrcamentoPdfWizard({
                   </div>
                 )}
 
-                {phase === "processing_ai" && isMultiBatch && processingDetail ? (
+                {phase === "processing_ai" && showQueuePanel && processingDetail ? (
                   <p className="mt-4 border-t border-slate-100 pt-4 text-xs text-slate-500">
                     {processingDetail}
                   </p>
@@ -661,11 +700,13 @@ export function OrcamentoPdfWizard({
                   onClick={() => void handleStartFlow()}
                   className={`${btnPrimary} mt-6 w-full py-3`}
                 >
-                  {isFullPdf
-                    ? files.length > 1
-                      ? `Enviar e analisar ${files.length} documentos`
-                      : "Enviar e analisar documento completo"
-                    : "Enviar e escolher tabela"}
+                  {allowsMultiple && files.length > 1
+                    ? enableMultiUpload && !isFullPdf
+                      ? `Enviar ${files.length} editais para a fila`
+                      : `Enviar e analisar ${files.length} documentos`
+                    : allowsMultiple
+                      ? "Enviar e analisar documento completo"
+                      : "Enviar e escolher tabela"}
                 </button>
               )}
 

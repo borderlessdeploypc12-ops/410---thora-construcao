@@ -52,7 +52,6 @@ from firebase_admin import auth as firebase_auth
 from services.openai_service import (
     identify_tables,
     process_selected_table,
-    process_full_pdf_analitico,
     generate_report_chat,
     OpenAIServiceError,
     _coerce_bdi,
@@ -60,22 +59,32 @@ from services.openai_service import (
 )
 from services.analitico_job import (
     clear_job,
-    complete_job,
-    fail_job,
     get_job,
     init_job,
-    make_progress_callback,
 )
 from services.analitico_queue import (
     AnaliticoQueueJob,
     enqueue_analitico_job,
     get_queue_position,
+    is_celery_queue_enabled,
     start_queue_worker,
 )
+from services.analitico_runner import process_queued_analitico_job
+from services.abc_job import (
+    get_job as get_abc_job,
+    get_user_jobs,
+    init_job as init_abc_job,
+    update_job as update_abc_job,
+)
+from services.abc_queue import AbcQueueJob, enqueue_abc_job, start_abc_queue_worker
+from services.abc_runner import process_abc_queue_job
 from services.storage_service import (
     download_pdf_bytes_async,
+    is_storage_available,
     upload_pdf_bytes_async,
 )
+from services.upload_meta import load_upload_meta as _load_upload_meta_service
+from services.upload_meta import save_upload_meta as _save_upload_meta_service
 from services.report_pdf import build_analysis_pdf_bytes
 from services.ai_audit_logger import log_ai_exchange
 from services.xlsx_export import save_export_workbook
@@ -424,26 +433,13 @@ def _meta_path_for_upload_id(upload_id: str) -> Path:
 
 
 def _save_upload_meta(upload_id: str, meta_dict: Dict) -> None:
-    """Salva metadados do upload em arquivo JSON"""
-    try:
-        meta_path = _meta_path_for_upload_id(upload_id)
-        with open(meta_path, "w") as f:
-            json.dump(meta_dict, f, indent=2)
-        logger.debug(f"✅ Metadados salvos: {meta_path}")
-    except Exception as e:
-        logger.warning(f"⚠️  Erro ao salvar metadados: {e}")
+    """Salva metadados do upload em arquivo JSON."""
+    _save_upload_meta_service(upload_id, meta_dict)
 
 
 def _load_upload_meta(upload_id: str) -> Dict:
-    """Carrega metadados do upload de arquivo JSON"""
-    try:
-        meta_path = _meta_path_for_upload_id(upload_id)
-        if meta_path.exists():
-            with open(meta_path) as f:
-                return json.load(f)
-    except Exception as e:
-        logger.warning(f"⚠️  Erro ao carregar metadados: {e}")
-    return {}
+    """Carrega metadados do upload de arquivo JSON."""
+    return _load_upload_meta_service(upload_id)
 
 
 def _validate_upload_id(upload_id: str) -> str:
@@ -1219,12 +1215,21 @@ async def _cloud_upload_pdf_background(
 ) -> None:
     """Envia PDF ao Firebase Storage e persiste URL nos metadados."""
     try:
+        if not is_storage_available():
+            meta = _load_upload_meta(upload_id)
+            meta["cloudUploadStatus"] = "unavailable"
+            _save_upload_meta(upload_id, meta)
+            return
+
         storage_url = await upload_pdf_bytes_async(
             upload_id=upload_id,
             user_id=user_id,
             pdf_bytes=pdf_bytes,
         )
         if not storage_url:
+            meta = _load_upload_meta(upload_id)
+            meta["cloudUploadStatus"] = "failed"
+            _save_upload_meta(upload_id, meta)
             return
 
         meta = _load_upload_meta(upload_id)
@@ -1271,20 +1276,14 @@ async def _resolve_pdf_bytes_for_upload(upload_id: str, user_id: str) -> bytes:
     )
 
 
-async def _process_queued_analitico_job(job: AnaliticoQueueJob) -> None:
-    pdf_bytes = await _resolve_pdf_bytes_for_upload(job.upload_id, job.user_id)
-    await _run_analitico_full_job(
-        job.upload_id,
-        job.user_id,
-        job.filename,
-        pdf_bytes,
-        force_reprocess=job.force_reprocess,
-    )
-
-
 @app.on_event("startup")
 async def _startup_analitico_queue() -> None:
-    start_queue_worker(_process_queued_analitico_job)
+    start_queue_worker(process_queued_analitico_job)
+    start_abc_queue_worker(process_abc_queue_job)
+    if is_celery_queue_enabled():
+        logger.info("Filas: Celery + Redis (analítico e Curva ABC)")
+    else:
+        logger.info("Filas: workers em memória (dev / sem Redis)")
 
 
 # ============== HEALTH CHECK ==============
@@ -1770,6 +1769,27 @@ async def detect_orcamento_tables(
     }
 
 
+@app.get("/api/orcamentos/{upload_id}/table-candidates")
+async def get_orcamento_table_candidates(
+    upload_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Retorna tabelas já detectadas (cache) sem reprocessar o PDF."""
+    upload_id = _validate_upload_id(upload_id)
+    meta = _load_upload_meta(upload_id)
+    _assert_upload_access(user_id, meta.get("userId"))
+
+    upload_data = _get_upload_data_from_sources(upload_id) or {}
+    options = upload_data.get("table_candidates") or []
+    return {
+        "status": "success",
+        "upload_id": upload_id,
+        "tables_found": len(options),
+        "options": options,
+        "cached": True,
+    }
+
+
 def _normalize_analytic_items(raw_items: List[Any]) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
     for idx, it in enumerate(raw_items):
@@ -1823,6 +1843,25 @@ async def process_orcamento_confirmed(
     Processa a tabela escolhida com GPT-4o e persiste orçamento + ia_metadata.
     """
     upload_id = _validate_upload_id(payload.upload_id)
+    meta = _load_upload_meta(upload_id)
+    _assert_upload_access(user_id, meta.get("userId"))
+
+    ids_to_process = payload.table_ids
+    if not ids_to_process and payload.table_id:
+        ids_to_process = [payload.table_id]
+    if not ids_to_process:
+        raise HTTPException(status_code=400, detail="Nenhuma tabela selecionada")
+
+    return await _execute_process_confirmed(upload_id, user_id, ids_to_process)
+
+
+async def _execute_process_confirmed(
+    upload_id: str,
+    user_id: str,
+    ids_to_process: list[str],
+) -> Dict[str, Any]:
+    """Núcleo do process-confirmed (usado pela API e pela fila ABC)."""
+    upload_id = _validate_upload_id(upload_id)
     file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"Upload não encontrado: {upload_id}")
@@ -1847,14 +1886,6 @@ async def process_orcamento_confirmed(
 
     upload_data = _get_upload_data_from_sources(upload_id) or {}
     table_candidates = upload_data.get("table_candidates") or []
-    
-    # Suportar tanto o novo formato (lista) quanto o antigo (string)
-    ids_to_process = payload.table_ids
-    if not ids_to_process and payload.table_id:
-        ids_to_process = [payload.table_id]
-        
-    if not ids_to_process:
-        raise HTTPException(status_code=400, detail="Nenhuma tabela selecionada")
 
     candidate_ids = {str(c.get("id")) for c in table_candidates if c.get("id")}
     unknown_ids = [t_id for t_id in ids_to_process if t_id and t_id not in candidate_ids]
@@ -2133,6 +2164,181 @@ async def process_orcamento_confirmed(
     }
 
 
+class AbcRegisterJobItem(BaseModel):
+    upload_id: str
+    filename: str
+
+
+class AbcBatchRegisterRequest(BaseModel):
+    jobs: list[AbcRegisterJobItem] = Field(..., min_length=1)
+
+
+class AbcJobUpdateRequest(BaseModel):
+    status: str | None = None
+    message: str | None = None
+    tables_found: int | None = None
+    error: str | None = None
+
+
+class AbcBatchStatusRequest(BaseModel):
+    upload_ids: list[str] = Field(..., min_length=1)
+
+
+class AbcProcessRequest(BaseModel):
+    upload_id: str
+    table_ids: list[str] = Field(..., min_length=1)
+
+
+def _build_abc_job_status(upload_id: str) -> Dict[str, Any]:
+    from services.abc_queue import get_queue_position
+
+    job = get_abc_job(upload_id)
+    if not job:
+        return {
+            "upload_id": upload_id,
+            "status": "not_found",
+            "message": "Job não encontrado",
+            "queue_position": 0,
+            "tables_found": 0,
+        }
+
+    position = get_queue_position(upload_id)
+    if job.get("status") == "queued" and position > 0:
+        job = {**job, "queue_position": position}
+
+    return job
+
+
+@app.post("/api/abc-analysis/batch-register")
+async def abc_batch_register(
+    payload: AbcBatchRegisterRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Registra lote de análises Curva ABC após upload dos PDFs."""
+    registered: list[Dict[str, Any]] = []
+    for item in payload.jobs:
+        upload_id = _validate_upload_id(item.upload_id)
+        meta = _load_upload_meta(upload_id)
+        _assert_upload_access(user_id, meta.get("userId"))
+        job = init_abc_job(
+            upload_id,
+            user_id=user_id,
+            filename=item.filename,
+            status="uploading",
+            message="Arquivo recebido — aguardando detecção de tabelas…",
+        )
+        registered.append(job)
+    return {"status": "success", "jobs": registered}
+
+
+@app.patch("/api/abc-analysis/{upload_id}")
+async def abc_update_job_status(
+    upload_id: str,
+    payload: AbcJobUpdateRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Atualiza status de um job ABC (ex.: após detect-tables no frontend)."""
+    upload_id = _validate_upload_id(upload_id)
+    meta = _load_upload_meta(upload_id)
+    _assert_upload_access(user_id, meta.get("userId"))
+
+    job = get_abc_job(upload_id)
+    if not job:
+        init_abc_job(
+            upload_id,
+            user_id=user_id,
+            filename=str(meta.get("filename") or f"{upload_id}.pdf"),
+        )
+
+    fields: Dict[str, Any] = {}
+    if payload.status:
+        if payload.status not in {
+            "uploading",
+            "detecting",
+            "awaiting_selection",
+            "queued",
+            "processing",
+            "completed",
+            "failed",
+        }:
+            raise HTTPException(status_code=400, detail="Status inválido")
+        fields["status"] = payload.status
+    if payload.message is not None:
+        fields["message"] = payload.message
+    if payload.tables_found is not None:
+        fields["tables_found"] = payload.tables_found
+    if payload.error is not None:
+        fields["error"] = payload.error
+
+    if fields:
+        update_abc_job(upload_id, **fields)
+
+    return {"status": "success", "job": _build_abc_job_status(upload_id)}
+
+
+@app.post("/api/abc-analysis/process")
+async def abc_enqueue_process(
+    payload: AbcProcessRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Enfileira processamento IA após seleção de tabelas."""
+    upload_id = _validate_upload_id(payload.upload_id)
+    meta = _load_upload_meta(upload_id)
+    _assert_upload_access(user_id, meta.get("userId"))
+
+    file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Upload não encontrado: {upload_id}")
+
+    filename = str(meta.get("filename") or f"{upload_id}.pdf")
+    position = enqueue_abc_job(
+        AbcQueueJob(
+            upload_id=upload_id,
+            user_id=user_id,
+            filename=filename,
+            table_ids=payload.table_ids,
+        )
+    )
+    return {
+        "status": "queued",
+        "upload_id": upload_id,
+        "queue_position": position,
+        "message": f"Na fila de processamento (posição {position})…",
+    }
+
+
+@app.get("/api/abc-analysis/list")
+async def abc_list_jobs(user_id: str = Depends(get_current_user_id)):
+    """Lista análises Curva ABC do usuário."""
+    jobs = get_user_jobs(user_id)
+    return {"status": "success", "jobs": jobs}
+
+
+@app.get("/api/abc-analysis/status/{upload_id}")
+async def abc_job_status(
+    upload_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    upload_id = _validate_upload_id(upload_id)
+    meta = _load_upload_meta(upload_id)
+    _assert_upload_access(user_id, meta.get("userId"))
+    return _build_abc_job_status(upload_id)
+
+
+@app.post("/api/abc-analysis/batch-status")
+async def abc_batch_status(
+    payload: AbcBatchStatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    jobs: list[Dict[str, Any]] = []
+    for raw_id in payload.upload_ids:
+        upload_id = _validate_upload_id(raw_id)
+        meta = _load_upload_meta(upload_id)
+        _assert_upload_access(user_id, meta.get("userId"))
+        jobs.append(_build_abc_job_status(upload_id))
+    return {"status": "success", "jobs": jobs}
+
+
 class ProcessAnaliticoFullRequest(BaseModel):
     upload_id: str | None = None
     upload_ids: list[str] | None = None
@@ -2184,119 +2390,6 @@ def _cached_analitico_payload(upload_id: str) -> Dict[str, Any] | None:
         "cached": True,
         "message": f"✅ Resultado em cache — {len(hierarchical)} linhas hierárquicas",
     }
-
-
-def _persist_analitico_result(
-    *,
-    upload_id: str,
-    user_id: str,
-    filename: str,
-    structured_data: Dict[str, Any],
-    provider_used: str,
-    storage_url: str | None = None,
-) -> Dict[str, Any]:
-    hierarchical_items = structured_data.get("hierarchical_items") or []
-    normalized_items = structured_data.get("items") or []
-    combined_resumo = structured_data.get("resumo") or {}
-
-    ia_metadata_final = {
-        "provider": provider_used,
-        "engine_used": "openai_full_pdf_analitico",
-        "model": OPENAI_ORCAMENTO_MODEL,
-        "combined_resumo": combined_resumo,
-        "pages_meta": structured_data.get("pages_meta") or [],
-    }
-
-    if not storage_url:
-        storage_url = (_load_upload_meta(upload_id) or {}).get("storageUrl")
-
-    try:
-        doc_id = OrcamentoFirestore.save_orcamento(
-            user_id=user_id,
-            upload_id=upload_id,
-            filename=filename,
-            tables=[],
-            items_data={
-                "items": normalized_items,
-                "hierarchical_items": hierarchical_items,
-                "resumo": combined_resumo,
-            },
-            ia_metadata=ia_metadata_final,
-            storage_url=storage_url,
-        )
-    except Exception as exc:
-        logger.error("process-analitico-full: erro ao salvar no Firestore: %s", exc)
-        doc_id = upload_id
-
-    _OFFLINE_CACHE.setdefault(upload_id, {})
-    _OFFLINE_CACHE[upload_id]["itemsData"] = {
-        "items": normalized_items,
-        "hierarchical_items": hierarchical_items,
-        "resumo": combined_resumo,
-    }
-    _OFFLINE_CACHE[upload_id]["ia_metadata"] = ia_metadata_final
-    _OFFLINE_CACHE[upload_id]["filename"] = filename
-    _save_extracted_cache(upload_id, _OFFLINE_CACHE[upload_id])
-
-    return {
-        "status": "success",
-        "upload_id": upload_id,
-        "document_id": doc_id,
-        "filename": filename,
-        "items_found": len(normalized_items),
-        "hierarchical_items": hierarchical_items,
-        "structured_items": hierarchical_items,
-        "items": normalized_items,
-        "resumo": combined_resumo,
-        "ia_metadata": ia_metadata_final,
-        "cached": False,
-        "message": f"✅ PDF analisado integralmente — {len(hierarchical_items)} linhas hierárquicas extraídas",
-    }
-
-
-async def _run_analitico_full_job(
-    upload_id: str,
-    user_id: str,
-    filename: str,
-    pdf_bytes: bytes,
-    *,
-    force_reprocess: bool = False,
-) -> None:
-    if force_reprocess:
-        _OFFLINE_CACHE.pop(upload_id, None)
-        cache_path = _cache_path_for_upload_id(upload_id)
-        if cache_path.exists():
-            try:
-                cache_path.unlink()
-            except OSError as exc:
-                logger.warning("Não foi possível limpar cache %s: %s", upload_id, exc)
-
-    try:
-        structured_data, provider_used = await process_full_pdf_analitico(
-            pdf_bytes,
-            filename=filename,
-            progress_callback=make_progress_callback(upload_id),
-        )
-        meta = _load_upload_meta(upload_id)
-        result = _persist_analitico_result(
-            upload_id=upload_id,
-            user_id=user_id,
-            filename=filename,
-            structured_data=structured_data,
-            provider_used=provider_used,
-            storage_url=meta.get("storageUrl"),
-        )
-        complete_job(upload_id, result)
-    except OpenAIServiceError as exc:
-        logger.error(
-            "process-analitico-full job %s — OpenAI/validação: %s",
-            upload_id,
-            exc,
-        )
-        fail_job(upload_id, str(exc))
-    except Exception as exc:
-        logger.exception("process-analitico-full job %s", upload_id)
-        fail_job(upload_id, str(exc))
 
 
 def _build_analitico_job_status(upload_id: str) -> Dict[str, Any]:
@@ -4007,6 +4100,9 @@ async def serve_frontend(path_name: str):
     Serve o frontend para rotas que não são API
     Necessário para SPA (Single Page Application)
     """
+    if path_name == "api" or path_name.startswith("api/"):
+        raise HTTPException(status_code=404, detail="API route not found")
+
     # Se é um arquivo com extensão (CSS, JS, etc), tentar servir como estático
     if "." in path_name and not path_name.startswith("api"):
         return {"error": "File not found"}
@@ -4031,6 +4127,19 @@ def _is_port_in_use(port: int) -> bool:
             return True
 
 
+def _thora_api_already_running(port: int) -> bool:
+    """Verifica se a Thora API já responde na porta (evita segundo uvicorn)."""
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            response = client.get(f"http://127.0.0.1:{port}/health")
+            if response.status_code != 200:
+                return False
+            payload = response.json()
+            return payload.get("status") == "online"
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
     import sys
     import uvicorn
@@ -4038,8 +4147,14 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
 
     if _is_port_in_use(port):
-        print(f"\n[ERRO] A porta {port} ja esta em uso — outro servidor ja esta rodando.")
-        print(f"   Acesse: http://localhost:{port}")
+        if _thora_api_already_running(port):
+            print(f"\n[OK] Thora API já está ativa em http://localhost:{port}")
+            print("   Não é necessário iniciar outro servidor.")
+            print("   Para reiniciar, encerre o processo na porta e rode py main.py novamente.\n")
+            sys.exit(0)
+
+        print(f"\n[ERRO] A porta {port} já está em uso por outro processo.")
+        print(f"   Se for a Thora API, acesse: http://localhost:{port}")
         print(
             f"\n   Para encerrar o processo anterior (PowerShell):\n"
             f"   Get-NetTCPConnection -LocalPort {port} | "

@@ -3,7 +3,7 @@ import Dashboard from "./pages/Dashboard";
 import NovoOrcamento from "./pages/NovoOrcamento";
 import ValidacaoOrcamento from "./pages/ValidacaoOrcamento";
 import CurvaABC from "./pages/CurvaABC";
-import OrcamentoAnalitico from "./pages/OrcamentoAnalitico";
+import ListaAnalises from "./pages/ListaAnalises";
 import OrcamentoSintetico from "./pages/OrcamentoSintetico";
 import CatalogoProdutos from "./pages/CatalogoProdutos";
 import Reports from "./pages/Reports";
@@ -26,8 +26,9 @@ const App = () => {
         <Route path="/validacao/:uploadId" element={<ValidacaoOrcamento />} />
         <Route path="/validacao" element={<Navigate to="/orcamento" replace />} />
         <Route path="/curva-abc/:uploadId" element={<CurvaABC />} />
-        <Route path="/orcamento-analitico/:uploadId" element={<OrcamentoAnalitico />} />
-        <Route path="/orcamento-analitico" element={<OrcamentoAnalitico />} />
+        <Route path="/lista-analises" element={<ListaAnalises />} />
+        <Route path="/orcamento-analitico/:uploadId" element={<Navigate to="/lista-analises" replace />} />
+        <Route path="/orcamento-analitico" element={<Navigate to="/lista-analises" replace />} />
         <Route path="/orcamento-sintetico/:uploadId" element={<OrcamentoSintetico />} />
         <Route path="/orcamento-sintetico" element={<OrcamentoSintetico />} />
         <Route

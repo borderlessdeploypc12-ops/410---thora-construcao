@@ -1,5 +1,5 @@
 """
-Estado em memória de jobs de Orçamento Analítico (progresso + resultado).
+Estado de jobs de Orçamento Analítico (Redis com fallback em memória).
 """
 
 from __future__ import annotations
@@ -7,13 +7,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
+from services.analitico_job_store import delete_job, get_job as _get_job, save_job
 
-_ANALITICO_JOBS: Dict[str, Dict[str, Any]] = {}
+logger = logging.getLogger(__name__)
 
 
 def get_job(upload_id: str) -> Optional[Dict[str, Any]]:
-    return _ANALITICO_JOBS.get(upload_id)
+    return _get_job(upload_id)
 
 
 def init_job(
@@ -35,15 +35,16 @@ def init_job(
         "error": None,
         "cached": False,
     }
-    _ANALITICO_JOBS[upload_id] = job
+    save_job(upload_id, job)
     return job
 
 
 def update_job(upload_id: str, **fields: Any) -> None:
-    job = _ANALITICO_JOBS.get(upload_id)
+    job = _get_job(upload_id)
     if not job:
         return
     job.update(fields)
+    save_job(upload_id, job)
 
 
 def make_progress_callback(upload_id: str):
@@ -60,12 +61,13 @@ def make_progress_callback(upload_id: str):
 
 
 def complete_job(upload_id: str, result: Dict[str, Any]) -> None:
+    job = _get_job(upload_id) or {}
     update_job(
         upload_id,
         status="completed",
         result=result,
         pages_done=result.get("resumo", {}).get("paginas_processadas")
-        or _ANALITICO_JOBS.get(upload_id, {}).get("pages_done"),
+        or job.get("pages_done"),
         message="Análise concluída",
     )
 
@@ -81,4 +83,4 @@ def fail_job(upload_id: str, error: str) -> None:
 
 
 def clear_job(upload_id: str) -> None:
-    _ANALITICO_JOBS.pop(upload_id, None)
+    delete_job(upload_id)

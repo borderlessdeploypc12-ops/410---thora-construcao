@@ -82,10 +82,10 @@ const OrcamentoSintetico: React.FC = () => {
         <LayoutList className="mx-auto h-12 w-12 text-slate-400" />
         <h1 className="mt-4 text-xl font-semibold text-slate-900">Orçamento Sintético</h1>
         <p className="mt-2 text-sm text-slate-600">
-          Processe um PDF no Orçamento Analítico para gerar o resumo por grupos.
+          Processe um PDF na Curva ABC para gerar o resumo por grupos.
         </p>
-        <Link to="/orcamento-analitico" className={`${btnAccent} mt-6 inline-flex`}>
-          Ir para Orçamento Analítico
+        <Link to="/orcamento" className={`${btnAccent} mt-6 inline-flex`}>
+          Ir para Curva ABC
         </Link>
       </div>
     );
@@ -105,9 +105,9 @@ const OrcamentoSintetico: React.FC = () => {
             <button
               type="button"
               className={btnMuted}
-              onClick={() => navigate(`/orcamento-analitico/${uploadId}`)}
+              onClick={() => navigate(`/validacao/${uploadId}`)}
             >
-              Ver Analítico
+              Ver validação
             </button>
           )}
           <button

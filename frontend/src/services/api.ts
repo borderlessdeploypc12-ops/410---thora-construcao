@@ -132,6 +132,41 @@ export const extractPDF = async (uploadId: string) => {
   }
 };
 
+export type OrcamentoTableCandidate = {
+  id: string;
+  nome_tabela?: string;
+  preview_texto?: string;
+  num_pagina?: number;
+  pagina?: number;
+  coordenadas?: number[];
+  imagem_base64?: string;
+};
+
+export type OrcamentoTableDetectResponse = {
+  status: string;
+  upload_id: string;
+  tables_found: number;
+  options: OrcamentoTableCandidate[];
+  mock_fallback?: boolean;
+  recommended_table_ids?: string[];
+  cached?: boolean;
+};
+
+/** Retorna tabelas já detectadas (cache no backend) — rápido, sem reprocessar o PDF. */
+export const getOrcamentoTableCandidates = async (
+  uploadId: string,
+): Promise<OrcamentoTableDetectResponse> => {
+  try {
+    const response = await apiClient.get(
+      `/api/orcamentos/${uploadId}/table-candidates`,
+      { timeout: 30000 },
+    );
+    return response.data as OrcamentoTableDetectResponse;
+  } catch (error: unknown) {
+    throw new Error(parseApiError(error, "Erro ao carregar tabelas detectadas"));
+  }
+};
+
 /** Lista tabelas candidatas após upload (curadoria antes da IA). */
 export const detectOrcamentoTables = async (uploadId: string) => {
   const formData = new FormData();
@@ -141,22 +176,7 @@ export const detectOrcamentoTables = async (uploadId: string) => {
       headers: { "Content-Type": "multipart/form-data" },
       timeout: 180000,
     });
-    return response.data as {
-      status: string;
-      upload_id: string;
-      tables_found: number;
-      options: {
-        id: string;
-        nome_tabela?: string;
-        preview_texto?: string;
-        num_pagina?: number;
-        pagina?: number;
-        coordenadas?: number[];
-        imagem_base64?: string;
-      }[];
-      mock_fallback?: boolean;
-      recommended_table_ids?: string[];
-    };
+    return response.data as OrcamentoTableDetectResponse;
   } catch (error: any) {
     const detail = error.response?.data?.detail;
     const msg =

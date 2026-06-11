@@ -104,6 +104,18 @@ FIREBASE_STORAGE_BUCKET = os.getenv(
     "borderless-5a4c8.firebasestorage.app",
 )
 
+# Redis / Celery (fila persistente de Orçamento Analítico)
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL).strip()
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", REDIS_URL).strip()
+_default_use_celery = "false" if IS_VERCEL else "true"
+USE_CELERY_QUEUE = os.getenv("USE_CELERY_QUEUE", _default_use_celery).lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+) and bool(CELERY_BROKER_URL) and not IS_VERCEL
+
 if GEMINI_API_KEY:
     print("GEMINI_API_KEY carregada")
 else:

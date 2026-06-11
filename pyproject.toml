@@ -66,7 +66,9 @@ dependencies = [
   "urllib3==2.6.3",
   "camelot-py[cv]",
   "PyMuPDF",
-  "opencv-python-headless"
+  "opencv-python-headless",
+  "celery>=5.4.0",
+  "redis>=5.0.0"
 ]
 
 [build-system]

@@ -32,9 +32,13 @@ export default function NovoOrcamento() {
       <OrcamentoPdfWizard
         steps={ANALISE_ABC_WIZARD_STEPS}
         title="Análise Curva ABC"
-        subtitle={`Passo 1 de ${ANALISE_ABC_WIZARD_STEPS.length} — envie o PDF, selecione as tabelas e a IA montará os dados para validação.`}
+        subtitle={`Passo 1 de ${ANALISE_ABC_WIZARD_STEPS.length} — envie um PDF ou vários editais; lotes seguem para a Lista de análises.`}
         processingLabel="Passo 3 — IA analisando tabelas e montando a Curva ABC…"
         logTag="Curva ABC"
+        enableMultiUpload
+        onBatchUpload={(files) => {
+          navigate("/lista-analises", { state: { pendingFiles: files } });
+        }}
         onComplete={handleComplete}
       />
     </div>
