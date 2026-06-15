@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: four10-thora-construcao
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 --timeout 600 --graceful-timeout 30 -b 0.0.0.0:$PORT -k uvicorn.workers.UvicornWorker main:app
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DETECT_TABLES_MAX_PAGES
+        value: "20"
+      - key: FRONTEND_URL
+        value: https://borderles-410.netlify.app
+      - key: FRONTEND_URLS
+        value: https://borderles-410.netlify.app,https://410-thora.netlify.app

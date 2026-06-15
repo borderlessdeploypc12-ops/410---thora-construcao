@@ -20,9 +20,12 @@
 | **Name**          | `borderless-api`                                                                         |
 | **Region**        | `Ohio (US East)` ou próximo de seus usuários                                             |
 | **Branch**        | `main`                                                                                   |
+| **Root Directory**| `backend`                                                                                |
 | **Runtime**       | `Python 3`                                                                               |
-| **Build Command** | `pip install -r backend/requirements.txt && pip install gunicorn uvicorn[standard]`      |
-| **Start Command** | `cd backend && gunicorn -w 1 --timeout 600 --graceful-timeout 30 -b 0.0.0.0:$PORT -k uvicorn.workers.UvicornWorker main:app` |
+| **Build Command** | `pip install -r requirements.txt`                                                        |
+| **Start Command** | `gunicorn -w 1 --timeout 600 --graceful-timeout 30 -b 0.0.0.0:$PORT -k uvicorn.workers.UvicornWorker main:app` |
+
+> **Importante:** se **Root Directory** = `backend`, **não** use `cd backend` no Start Command — o Render já inicia dentro dessa pasta. O `Procfile` na raiz do repo (com `cd backend`) é para Railway/nixpacks na raiz do repositório.
 
 ### 3️⃣ Configurar Variáveis de Ambiente
 
