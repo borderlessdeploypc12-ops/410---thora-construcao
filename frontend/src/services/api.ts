@@ -26,11 +26,10 @@ const getAPIBase = () => {
     window.location.hostname === "thora-construcao.vercel.app";
   const isRenderHost = window.location.hostname.endsWith(".onrender.com");
 
-  const isNetlifyHost = window.location.hostname.endsWith(".netlify.app");
-
-  // Netlify: mesma origem + proxy em netlify.toml (evita CORS durante cold start do Render).
-  if (!import.meta.env.DEV && isNetlifyHost) {
-    return window.location.origin;
+  // VITE_API_URL explícito (ex.: Render) — necessário para operações longas (>30s).
+  // Proxy Netlify tem timeout ~26s e quebra detect-tables / upload grande.
+  if (import.meta.env.VITE_API_URL) {
+    return import.meta.env.VITE_API_URL;
   }
 
   // Em deploy fullstack, API e frontend ficam no mesmo domínio.
@@ -40,10 +39,6 @@ const getAPIBase = () => {
 
   if (isLocalhost) {
     return window.location.origin;
-  }
-
-  if (import.meta.env.VITE_API_URL) {
-    return import.meta.env.VITE_API_URL;
   }
 
   if (import.meta.env.DEV) {

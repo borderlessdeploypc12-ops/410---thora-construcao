@@ -86,6 +86,7 @@ from services.storage_service import (
     is_storage_available,
     upload_pdf_bytes_async,
 )
+from services.cloud_upload import wait_for_cloud_upload
 from services.upload_meta import load_upload_meta as _load_upload_meta_service
 from services.upload_meta import save_upload_meta as _save_upload_meta_service
 from services.report_pdf import build_analysis_pdf_bytes
@@ -1297,6 +1298,20 @@ async def _cloud_upload_pdf_background(
         _save_upload_meta(upload_id, meta)
 
 
+async def _ensure_pdf_on_disk(upload_id: str, user_id: str) -> Path:
+    """Garante PDF no disco local — baixa do Firebase Storage se necessário (Render ephemeral)."""
+    file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
+    if file_path.is_file():
+        return file_path
+
+    await wait_for_cloud_upload(upload_id, timeout_seconds=60)
+    await _resolve_pdf_bytes_for_upload(upload_id, user_id)
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Upload não encontrado: {upload_id}")
+    return file_path
+
+
 async def _resolve_pdf_bytes_for_upload(upload_id: str, user_id: str) -> bytes:
     """Obtém bytes do PDF (disco local ou Firebase Storage)."""
     file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
@@ -1804,9 +1819,7 @@ async def detect_orcamento_tables(
     Lista candidatos a tabela orçamentária (pdfplumber + fallback Camelot em páginas limitadas).
     """
     upload_id = _validate_upload_id(upload_id)
-    file_path = UPLOAD_FOLDER / f"{upload_id}.pdf"
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail=f"Upload não encontrado: {upload_id}")
+    file_path = await _ensure_pdf_on_disk(upload_id, user_id)
 
     meta = _load_upload_meta(upload_id)
     expected_user = meta.get("userId")
