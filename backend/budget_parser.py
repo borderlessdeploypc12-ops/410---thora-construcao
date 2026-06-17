@@ -32,7 +32,15 @@ class BudgetParser:
     BDI_KEYWORDS = ['bdi', '% bdi', 'encargos']
     
     # Palavras para ignorar (linhas de totalizações)
-    IGNORE_KEYWORDS = ['total geral', 'subtotal', 'total:', 'suma', 'resumen', 'grand total']
+    IGNORE_KEYWORDS = [
+        'total geral',
+        'subtotal',
+        'total:',
+        'suma',
+        'resumen',
+        'grand total',
+        'total do grupo',
+    ]
     
     def __init__(self):
         self.confidence = 0.0
@@ -135,9 +143,13 @@ class BudgetParser:
             'bdi': -1,
         }
 
+        qty_plain = -1
+        qty_max = -1
+        qty_min = -1
+
         for idx, cell in enumerate(header_row):
             cell_lower = str(cell).lower().strip()
-            
+
             if structure['codigo'] == -1:
                 for keyword in self.CODIGO_KEYWORDS:
                     if keyword in cell_lower:
@@ -155,33 +167,40 @@ class BudgetParser:
                     if keyword in cell_lower:
                         structure['descricao'] = idx
                         break
-            
-            if structure['quantidade'] == -1:
-                for keyword in self.QUANTIDADE_KEYWORDS:
-                    if keyword in cell_lower:
-                        structure['quantidade'] = idx
-                        break
-                if structure['quantidade'] == -1 and 'qtde' in cell_lower and 'mín' not in cell_lower and 'min' not in cell_lower:
-                    structure['quantidade'] = idx
-            
+
+            if 'qtde' in cell_lower or 'quant' in cell_lower or 'qtd' in cell_lower:
+                if 'mín' in cell_lower or 'min' in cell_lower:
+                    qty_min = idx
+                elif 'máx' in cell_lower or 'max' in cell_lower:
+                    qty_max = idx
+                elif qty_plain < 0:
+                    qty_plain = idx
+
             if structure['unidade'] == -1:
                 for keyword in self.UNIDADE_KEYWORDS:
                     if keyword in cell_lower:
                         structure['unidade'] = idx
                         break
-            
+
             if structure['valor_unitario'] == -1:
                 for keyword in self.VALOR_KEYWORDS:
                     if keyword in cell_lower and 'total' not in cell_lower:
                         structure['valor_unitario'] = idx
                         break
-            
+
             if structure['valor_total'] == -1:
                 for keyword in self.TOTAL_KEYWORDS:
                     if keyword in cell_lower:
                         structure['valor_total'] = idx
                         break
-        
+
+        if qty_plain >= 0:
+            structure['quantidade'] = qty_plain
+        elif qty_max >= 0:
+            structure['quantidade'] = qty_max
+        elif qty_min >= 0:
+            structure['quantidade'] = qty_min
+
         return structure
     
     def guess_columns_from_data(self, rows: List[List[Any]]) -> Dict[str, int]:
@@ -269,34 +288,59 @@ class BudgetParser:
             logger.warning("⚠️ Não foi possível identificar colunas de descrição/código")
             return items, structure
         
-        # 4. Extrair itens
+        # 4. Extrair itens (suporta cabeçalhos repetidos entre grupos)
+        active_structure = dict(structure)
         for idx, row in enumerate(rows[header_idx + 1:], start=header_idx + 1):
+            if self.is_header_row(row):
+                active_structure = self.identify_columns(row)
+                continue
             if self.should_ignore_row(row):
                 continue
-            
-            try:
-                # Extrair valores
-                codigo = ""
-                if structure.get('codigo', -1) >= 0 and structure['codigo'] < len(row):
-                    codigo = str(row[structure['codigo']]).strip()
 
-                if structure.get('descricao', -1) >= 0 and structure['descricao'] < len(row):
-                    descricao = str(row[structure['descricao']]).strip()
+            try:
+                codigo = ""
+                if active_structure.get('codigo', -1) >= 0 and active_structure['codigo'] < len(row):
+                    codigo = str(row[active_structure['codigo']]).strip()
+
+                if active_structure.get('descricao', -1) >= 0 and active_structure['descricao'] < len(row):
+                    descricao = str(row[active_structure['descricao']]).strip()
                 else:
                     descricao = ""
                 if not descricao and codigo:
                     descricao = codigo
-                elif descricao and codigo and codigo not in descricao:
-                    descricao = f"{codigo} — {descricao}"
 
-                quantidade = self.parse_number(row[structure['quantidade']]) if structure['quantidade'] >= 0 and structure['quantidade'] < len(row) else 0
-                unidade = str(row[structure['unidade']]).strip() if structure['unidade'] >= 0 and structure['unidade'] < len(row) else "un"
-                valor_unitario = self.parse_number(row[structure['valor_unitario']]) if structure['valor_unitario'] >= 0 and structure['valor_unitario'] < len(row) else 0
+                quantidade = (
+                    self.parse_number(row[active_structure['quantidade']])
+                    if active_structure['quantidade'] >= 0 and active_structure['quantidade'] < len(row)
+                    else 0
+                )
+                unidade = (
+                    str(row[active_structure['unidade']]).strip()
+                    if active_structure['unidade'] >= 0 and active_structure['unidade'] < len(row)
+                    else "un"
+                )
+                bdi = (
+                    self.parse_number(row[active_structure['bdi']])
+                    if active_structure.get('bdi', -1) >= 0 and active_structure['bdi'] < len(row)
+                    else 0.0
+                )
+                valor_unitario = (
+                    self.parse_number(row[active_structure['valor_unitario']])
+                    if active_structure['valor_unitario'] >= 0 and active_structure['valor_unitario'] < len(row)
+                    else 0
+                )
 
-                if structure['valor_total'] >= 0 and structure['valor_total'] < len(row):
-                    valor_total = self.parse_number(row[structure['valor_total']])
+                if active_structure['valor_total'] >= 0 and active_structure['valor_total'] < len(row):
+                    valor_total = self.parse_number(row[active_structure['valor_total']])
                 else:
                     valor_total = quantidade * valor_unitario
+
+                if bdi > 0 and valor_unitario > 0 and abs(valor_unitario - bdi) < 0.01:
+                    valor_unitario = 0.0
+                    valor_total = 0.0
+                if valor_unitario > 0 and 8 <= valor_unitario <= 40 and bdi <= 0 and quantidade > 100:
+                    valor_unitario = 0.0
+                    valor_total = 0.0
 
                 if not descricao or len(descricao) < 3:
                     continue
@@ -310,6 +354,7 @@ class BudgetParser:
                     'descricao': descricao,
                     'quantidade': quantidade,
                     'unidade': unidade or 'un',
+                    'bdi': bdi,
                     'valor_unitario': valor_unitario,
                     'valor_total': valor_total if valor_total > 0 else quantidade * valor_unitario,
                     'status': 'validado',

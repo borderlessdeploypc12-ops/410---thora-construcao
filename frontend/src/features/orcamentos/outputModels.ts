@@ -67,6 +67,8 @@ export type NovoOrcamentoFlowState = {
   modelosSelecionados?: OutputModelsSelection;
   file?: File;
   uploadId?: string;
+  filename?: string;
+  fromListaAnalises?: boolean;
   selectedTableIds?: string[];
   selectedTablePreviews?: unknown[];
   extractedData?: unknown[];

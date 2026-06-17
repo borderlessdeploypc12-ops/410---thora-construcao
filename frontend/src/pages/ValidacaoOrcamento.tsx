@@ -5,17 +5,18 @@ import pdfWorkerSrc from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import {
   ArrowLeft,
   AlertCircle,
-  Check,
-  Trash2,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   ZoomIn,
   ZoomOut,
   Loader2,
   Download,
-  CheckCircle2,
+  Trash2,
   LayoutList,
   FileSpreadsheet,
+  TrendingUp,
+  Layers,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -49,6 +50,9 @@ import {
 import type { NovoOrcamentoFlowState } from "../features/orcamentos/outputModels";
 import { CURVA_ABC_ONLY, FULL_ORCAMENTO_EXPORT } from "../features/orcamentos/outputModels";
 import { exportOrcamentoExcel } from "../features/orcamentos/exportOrcamento";
+import { mapRawListToLinhasAnaliticas } from "../features/orcamentos/orcamentoAnalitico";
+import { recalcularGruposAnalitico } from "../features/orcamentos/recalcularAnaliticoHierarquico";
+import { useOrcamentoLinhasContext } from "../features/orcamentos/OrcamentoLinhasContext";
 import { WizardStepper } from "../components/WizardStepper";
 import {
   ANALISE_ABC_VALIDATION_STEP,
@@ -100,6 +104,8 @@ interface StructuredBudgetItem {
   "Valor Unitário"?: number | string;
   valor_total?: number | string;
   Total?: number | string;
+  confianca?: number;
+  alertas?: string[];
 }
 
 const toNumber = (value: unknown): number => {
@@ -152,6 +158,9 @@ const mapStructuredItemsToValidation = (
       unitPrice,
       lineTotal: 0,
       selected: false,
+      extractionConfidence:
+        typeof item.confianca === "number" ? item.confianca : undefined,
+      extractionAlerts: Array.isArray(item.alertas) ? item.alertas : undefined,
     });
   }
 
@@ -229,12 +238,34 @@ const mapStoredItemsToValidation = (rawItems: unknown[]): ItemOrcamento[] => {
   return mapped;
 };
 
+function buildItemExportPayload(items: ItemOrcamento[]): Record<string, unknown>[] {
+  return items.map((item) => ({
+    id: String(item.id),
+    item: item.item ?? "",
+    tipo: item.tipo ?? "item",
+    banco: item.banco ?? "",
+    codigo: item.code,
+    descricao: item.description,
+    unidade: item.unit,
+    quantidade: item.qty,
+    valor_unitario: item.unitPrice,
+    valor_total: item.lineTotal,
+    bdi: item.bdi,
+    classification: item.classification,
+    accumulated_percentage: item.accumulated_percentage,
+  }));
+}
+
 export default function ValidacaoOrcamento() {
   const navigate = useNavigate();
   const location = useLocation();
   const flowState = location.state as NovoOrcamentoFlowState | null;
   const { uploadId: uploadIdFromRoute } = useParams<{ uploadId: string }>();
   const { user } = useAuth();
+  const { setOrcamentoLinhas } = useOrcamentoLinhasContext();
+
+  const fromListaAnalises = Boolean(flowState?.fromListaAnalises);
+  const isReopenedAnalysis = fromListaAnalises || (!flowState?.file && Boolean(uploadIdFromRoute));
 
   const resolvedUploadId =
     (flowState?.uploadId as string | undefined) ?? uploadIdFromRoute;
@@ -257,6 +288,12 @@ export default function ValidacaoOrcamento() {
     () => items.reduce((sum, item) => sum + calcularEconomia(item), 0),
     [items],
   );
+
+  const editalSemPrecos = useMemo(() => {
+    const executive = items.filter(isExecutiveItem);
+    if (executive.length === 0) return false;
+    return executive.every((item) => item.unitPrice <= 0 && item.lineTotal <= 0);
+  }, [items]);
 
   const catalogMap = useMemo(() => {
     const map = new Map<string, CatalogoProduto>();
@@ -283,6 +320,28 @@ export default function ValidacaoOrcamento() {
   const [numPages, setNumPages] = useState<number>(0);
   const [pageNumber, setPageNumber] = useState<number>(1);
   const [scale, setScale] = useState<number>(1.0); // Zoom
+
+  const nomeProjetoExport = useMemo(
+    () =>
+      (flowState?.nomeProjeto as string | undefined) ||
+      (flowState?.filename as string | undefined)?.replace(/\.pdf$/i, "") ||
+      pdfFile?.name?.replace(/\.pdf$/i, "") ||
+      undefined,
+    [flowState?.nomeProjeto, flowState?.filename, pdfFile?.name],
+  );
+
+  useEffect(() => {
+    if (!resolvedUploadId || items.length === 0) return;
+    const raw =
+      hierarchicalItems.length > 0 ? hierarchicalItems : buildItemExportPayload(items);
+    const linhas = recalcularGruposAnalitico(mapRawListToLinhasAnaliticas(raw));
+    if (linhas.length === 0) return;
+    setOrcamentoLinhas({
+      linhas,
+      uploadId: resolvedUploadId,
+      nomeProjeto: nomeProjetoExport ?? "Orçamento",
+    });
+  }, [items, hierarchicalItems, resolvedUploadId, nomeProjetoExport, setOrcamentoLinhas]);
 
   const selectedTablePreviews = useMemo(() => {
     const raw = flowState?.selectedTablePreviews as SelectedTablePreview[] | undefined;
@@ -661,8 +720,6 @@ export default function ValidacaoOrcamento() {
     );
   };
 
-  const selectedItemsCount = items.filter(item => item.selected).length;
-
   const formatMoney = (value: number) => {
     return value.toLocaleString("pt-BR", {
       minimumFractionDigits: 2,
@@ -675,10 +732,61 @@ export default function ValidacaoOrcamento() {
     setNumPages(numPages);
   };
 
-  const nomeProjetoExport =
-    (flowState?.nomeProjeto as string | undefined) ||
-    pdfFile?.name?.replace(/\.pdf$/i, "") ||
-    undefined;
+  const buildChildRouteState = (): NovoOrcamentoFlowState => ({
+    ...flowState,
+    uploadId: resolvedUploadId ?? undefined,
+    filename: flowState?.filename ?? pdfFile?.name,
+    nomeProjeto: nomeProjetoExport,
+    hierarchicalItems,
+    structuredData: {
+      items: buildItemExportPayload(items),
+      hierarchicalItems,
+    },
+    fromListaAnalises,
+  });
+
+  const handleBack = () => {
+    navigate(fromListaAnalises ? "/lista-analises" : "/orcamento");
+  };
+
+  const handleOpenCurvaAbc = () => {
+    const selected = items.filter((item) => item.selected);
+    const payload = selected.length > 0 ? selected : items.filter(isExecutiveItem);
+    if (payload.length === 0) {
+      toast.warning("Nenhum item disponível", {
+        description: "Processe o PDF ou adicione itens à planilha antes de abrir a Curva ABC.",
+      });
+      return;
+    }
+    const uploadId = resolvedUploadId || "unknown";
+    navigate(`/curva-abc/${uploadId}`, {
+      state: {
+        ...buildChildRouteState(),
+        editedItems: buildItemExportPayload(payload),
+        items: buildItemExportPayload(payload),
+      },
+    });
+  };
+
+  const handleOpenSintetico = () => {
+    const id = resolvedUploadId || "unknown";
+    navigate(`/orcamento-sintetico/${id}`, {
+      state: {
+        ...buildChildRouteState(),
+        items: buildItemExportPayload(items),
+      },
+    });
+  };
+
+  const handleOpenAnalitico = () => {
+    const id = resolvedUploadId || "unknown";
+    navigate(`/orcamento-analitico/${id}`, {
+      state: {
+        ...buildChildRouteState(),
+        items: buildItemExportPayload(items),
+      },
+    });
+  };
 
   // Handler de Exportação XLSX (Curva ABC)
   const handleExport = async () => {
@@ -837,9 +945,9 @@ export default function ValidacaoOrcamento() {
         <div className="flex min-w-0 items-center gap-3">
           <button
             type="button"
-            onClick={() => navigate("/orcamento")}
+            onClick={handleBack}
             className={iconButton}
-            aria-label="Voltar para nova análise"
+            aria-label={fromListaAnalises ? "Voltar à lista de análises" : "Voltar para nova análise"}
           >
             <ArrowLeft className="h-5 w-5" />
           </button>
@@ -903,18 +1011,19 @@ export default function ValidacaoOrcamento() {
           </button>
           <button
             type="button"
-            disabled={isLoading || hierarchicalItems.length === 0}
+            disabled={isLoading || items.length === 0}
             className={`${btnMuted} shrink-0`}
-            onClick={() => {
-              const id = resolvedUploadId || "unknown";
-              navigate(`/orcamento-sintetico/${id}`, {
-                state: {
-                  ...flowState,
-                  uploadId: id,
-                  hierarchicalItems,
-                },
-              });
-            }}
+            onClick={handleOpenAnalitico}
+            title="Planilha analítica hierárquica"
+          >
+            <Layers className="h-4 w-4" />
+            Analítico
+          </button>
+          <button
+            type="button"
+            disabled={isLoading || items.length === 0}
+            className={`${btnMuted} shrink-0`}
+            onClick={handleOpenSintetico}
             title="Ver resumo gerencial por grupos"
           >
             <LayoutList className="h-4 w-4" />
@@ -922,30 +1031,56 @@ export default function ValidacaoOrcamento() {
           </button>
           <button
             type="button"
-            disabled={isLoading || selectedItemsCount === 0}
+            disabled={isLoading || items.length === 0}
             className={`${btnAccent} shrink-0`}
-            onClick={() => {
-              if (selectedItemsCount === 0) {
-                toast.warning("Selecione itens", {
-                  description: "Marque ao menos um item para ver o detalhe na Curva ABC.",
-                });
-                return;
-              }
-              const selectedItems = items.filter((item) => item.selected);
-              const uploadId = resolvedUploadId || "unknown";
-              navigate(`/curva-abc/${uploadId}`, {
-                state: {
-                  items: selectedItems,
-                  uploadId,
-                },
-              });
-            }}
+            onClick={handleOpenCurvaAbc}
+            title="Abrir gráfico e classificação ABC de todos os itens"
           >
-            <Check className="h-4 w-4" />
-            Analisar ({selectedItemsCount})
+            <TrendingUp className="h-4 w-4" />
+            Curva ABC
           </button>
         </div>
       </header>
+
+      {isReopenedAnalysis && !isLoading && !loadError && items.length > 0 ? (
+        <div className="shrink-0 border-b border-slate-200 bg-white px-4 py-3 sm:px-6">
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Produtos desta análise
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" className={btnMuted} onClick={handleOpenAnalitico}>
+              <Layers className="h-4 w-4" />
+              Orçamento analítico
+            </button>
+            <button type="button" className={btnMuted} onClick={handleOpenSintetico}>
+              <LayoutList className="h-4 w-4" />
+              Orçamento sintético
+            </button>
+            <button type="button" className={btnAccent} onClick={handleOpenCurvaAbc}>
+              <TrendingUp className="h-4 w-4" />
+              Curva ABC
+            </button>
+            <button
+              type="button"
+              className={btnMuted}
+              disabled={isExporting}
+              onClick={() => void handleExport()}
+            >
+              <Download className="h-4 w-4" />
+              Exportar ABC
+            </button>
+            <button
+              type="button"
+              className={btnMuted}
+              disabled={isExportingFull}
+              onClick={() => void handleExportFull()}
+            >
+              <FileSpreadsheet className="h-4 w-4" />
+              Pacote completo
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden lg:flex-row">
         <div className="flex max-h-[42vh] min-h-0 w-full flex-col border-b border-slate-200 bg-slate-100 lg:max-h-none lg:w-[38%] xl:w-5/12 lg:border-b-0 lg:border-r">
@@ -1169,6 +1304,17 @@ export default function ValidacaoOrcamento() {
                 Use a coluna <strong>Cód. catálogo</strong> para aplicar seu preço cadastrado.
                 A economia compara o total do edital com seu preço (quando menor).
               </p>
+              {editalSemPrecos ? (
+                <div className="mt-4 flex gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                  <span>
+                    Este edital traz a planilha com <strong>preços em branco</strong> (modelo de
+                    proposta). Código, descrição, quantidade e BDI foram extraídos do PDF — informe
+                    os valores unitários manualmente ou aplique preços do seu catálogo pela coluna{" "}
+                    <strong>Cód. catálogo</strong>.
+                  </span>
+                </div>
+              ) : null}
             </div>
           )}
 
@@ -1384,7 +1530,7 @@ export default function ValidacaoOrcamento() {
                             <span className="text-slate-300">-</span>
                           )}
                         </td>
-                        <td className="min-w-[14rem] max-w-[24rem] px-3 py-2 align-top">
+                        <td className="min-w-[14rem] max-w-none px-3 py-2 align-top">
                           <div className="flex items-start gap-1">
                             {item.extractionAlerts && item.extractionAlerts.length > 0 ? (
                               <span

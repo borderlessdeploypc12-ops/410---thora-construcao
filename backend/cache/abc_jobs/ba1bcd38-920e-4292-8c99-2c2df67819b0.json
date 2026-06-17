@@ -1,0 +1,26 @@
+{
+  "upload_id": "ba1bcd38-920e-4292-8c99-2c2df67819b0",
+  "user_id": "jL1Gpc2mkiPV8CMolei6prhA7th2",
+  "filename": "downloadeditalpe900072026.pdf",
+  "status": "completed",
+  "message": "Análise concluída — 22 item(ns). Clique para abrir.",
+  "queue_position": 0,
+  "tables_found": 5,
+  "items_found": 22,
+  "table_ids": [
+    "page_45_table_0",
+    "page_38_table_0"
+  ],
+  "result": {
+    "upload_id": "ba1bcd38-920e-4292-8c99-2c2df67819b0",
+    "filename": "downloadeditalpe900072026.pdf",
+    "items_found": 22,
+    "tables_found": 116,
+    "has_pdf": true,
+    "has_orcamento_cache": true
+  },
+  "error": null,
+  "created_at": "2026-06-17T14:11:08.050105",
+  "completed_at": "2026-06-17T14:14:12.958251",
+  "updated_at": "2026-06-17T14:14:12.958251"
+}

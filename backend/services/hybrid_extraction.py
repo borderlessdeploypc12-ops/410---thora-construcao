@@ -141,6 +141,63 @@ def score_item_confidence(item: Dict[str, Any]) -> Tuple[float, List[str]]:
     return max(0.0, min(1.0, round(score, 3))), alerts
 
 
+def merge_parser_as_primary(
+    parser_items: List[Dict[str, Any]],
+    ai_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Usa o parser local como base (lista completa) e enriquece com IA (descrição/preços).
+    Ideal para editais com colunas de preço em branco.
+    """
+    if not parser_items:
+        return ai_items
+
+    ai_by_code: dict[str, Dict[str, Any]] = {}
+    for ai_item in ai_items:
+        if not isinstance(ai_item, dict):
+            continue
+        codigo = _normalize_codigo(ai_item.get("codigo"))
+        if codigo:
+            ai_by_code[codigo] = ai_item
+
+    merged: List[Dict[str, Any]] = []
+    for index, parser_item in enumerate(parser_items):
+        if not isinstance(parser_item, dict):
+            continue
+
+        row = dict(parser_item)
+        codigo = _normalize_codigo(row.get("codigo"))
+        ai_match = ai_by_code.get(codigo)
+        if ai_match is None and index < len(ai_items) and isinstance(ai_items[index], dict):
+            ai_match = ai_items[index]
+
+        if ai_match:
+            ai_desc = str(ai_match.get("descricao") or "").strip()
+            parser_desc = str(row.get("descricao") or "").strip()
+            if len(ai_desc) > len(parser_desc):
+                row["descricao"] = ai_desc
+
+            for field in _NUMERIC_FIELDS:
+                ai_val = _coerce_number(ai_match.get(field))
+                parser_val = _coerce_number(row.get(field))
+                if ai_val <= 0:
+                    continue
+                if parser_val <= 0 or _numeric_divergence(ai_val, parser_val):
+                    row[field] = ai_val
+
+            ai_unidade = str(ai_match.get("unidade") or "").strip()
+            if ai_unidade and str(row.get("unidade") or "").strip() in ("", "un"):
+                row["unidade"] = ai_unidade
+
+        confianca, validation_alerts = score_item_confidence(row)
+        row["confianca"] = confianca
+        row["alertas"] = validation_alerts
+        row["origem_extracao"] = "parser_local_enriquecido_ia" if ai_match else "parser_local"
+        merged.append(row)
+
+    return merged
+
+
 def merge_ai_with_parser(
     ai_items: List[Dict[str, Any]],
     structure: Dict[str, Any],
@@ -160,6 +217,11 @@ def merge_ai_with_parser(
         parser_match = _find_parser_match(row, parser_items, index)
 
         if parser_match:
+            parser_desc = str(parser_match.get("descricao") or "").strip()
+            ai_desc = str(row.get("descricao") or "").strip()
+            if len(parser_desc) > len(ai_desc):
+                row["descricao"] = parser_desc
+
             for field in _NUMERIC_FIELDS:
                 ai_val = _coerce_number(row.get(field))
                 parser_val = _coerce_number(parser_match.get(field))

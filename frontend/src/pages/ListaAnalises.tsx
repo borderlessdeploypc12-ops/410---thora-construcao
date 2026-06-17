@@ -302,7 +302,13 @@ export default function ListaAnalises() {
   };
 
   const handleOpenCompleted = (item: AbcAnalysisJob) => {
-    navigate(`/validacao/${item.upload_id}`);
+    navigate(`/validacao/${item.upload_id}`, {
+      state: {
+        fromListaAnalises: true,
+        uploadId: item.upload_id,
+        filename: item.filename,
+      },
+    });
   };
 
   const closeModal = () => {

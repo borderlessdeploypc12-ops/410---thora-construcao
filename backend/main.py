@@ -30,6 +30,7 @@ from config import (
     BASE_DIR,
     CACHE_FOLDER,
     DETECT_TABLES_MAX_CANDIDATES,
+    DETECT_TABLES_CACHE_VERSION,
     DETECT_TABLES_MAX_PAGES,
     DETECT_TABLES_THUMB_SCALE,
     ENVIRONMENT,
@@ -93,6 +94,7 @@ from services.report_pdf import build_analysis_pdf_bytes
 from services.ai_audit_logger import log_ai_exchange
 from services.xlsx_export import save_export_workbook
 from services.analitico_normalize import normalize_hierarchical_analitico
+from services.hybrid_extraction import merge_parser_as_primary
 
 try:
     import pdfplumber
@@ -657,6 +659,89 @@ def _preview_text_for_table_rows(rows: List[List[Any]], max_chars: int = 280) ->
     return text[: max_chars - 1] + "…"
 
 
+def _normalize_extracted_table_rows(table: List[List[Any]]) -> List[List[Any]]:
+    processed_rows: List[List[Any]] = []
+    for row in table:
+        processed_row: List[Any] = []
+        for cell in row:
+            if cell is None:
+                processed_row.append("")
+            elif isinstance(cell, str):
+                processed_row.append(cell.strip().replace("\n", " "))
+            else:
+                processed_row.append(str(cell))
+        processed_rows.append(processed_row)
+    return processed_rows
+
+
+def _table_header_fingerprint(rows: List[List[Any]]) -> str:
+    parts: List[str] = []
+    for row in rows[:4]:
+        parts.append(" ".join(str(c).lower().strip() for c in row if str(c).strip()))
+    return "|".join(parts)[:240]
+
+
+def _best_table_signal(tables: List[List[List[Any]]]) -> Tuple[int, int]:
+    if not tables:
+        return 0, 0
+    best_nonempty = 0
+    best_score = 0
+    for table in tables:
+        if not table:
+            continue
+        rows = _normalize_extracted_table_rows(table)
+        best_nonempty = max(best_nonempty, _count_nonempty_table_rows(rows))
+        best_score = max(best_score, _score_budget_table_likelihood(rows))
+    return best_nonempty, best_score
+
+
+def _extract_page_tables_multi_strategy(page: Any) -> List[List[List[Any]]]:
+    """
+    Combina estratégias do pdfplumber na mesma página.
+    A estratégia por texto só rodava quando o padrão não encontrava nada; isso
+    perdia tabelas de orçamento quando o PDF tinha ruído tabular (ex.: página 47).
+    """
+    collected: List[List[List[Any]]] = []
+    seen_fingerprints: set[str] = set()
+
+    def add_tables(raw_tables: List[List[List[Any]]] | None) -> None:
+        if not raw_tables:
+            return
+        for table in raw_tables:
+            if not table:
+                continue
+            rows = _normalize_extracted_table_rows(table)
+            if _count_nonempty_table_rows(rows) < 2:
+                continue
+            fingerprint = _table_header_fingerprint(rows)
+            if fingerprint in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fingerprint)
+            collected.append(rows)
+
+    default_tables = page.extract_tables() or []
+    add_tables(default_tables)
+
+    best_nonempty, best_score = _best_table_signal(default_tables)
+    needs_fallback = best_nonempty < 12 or best_score < 25
+
+    if needs_fallback:
+        for settings in (_PDFPLUMBER_LINES_TABLE_SETTINGS, _PDFPLUMBER_TEXT_TABLE_SETTINGS):
+            try:
+                add_tables(page.extract_tables(settings) or [])
+            except Exception as exc:
+                logger.debug("  Extração alternativa falhou: %s", exc)
+
+    if not collected:
+        text = page.extract_text()
+        if text:
+            lines = [line.strip() for line in text.split("\n") if line.strip()]
+            if lines:
+                collected.append([[line] for line in lines])
+
+    return collected
+
+
 def _extract_tables_from_pdf_path(
     file_path: Path,
     max_pages: int | None = None,
@@ -680,62 +765,27 @@ def _extract_tables_from_pdf_path(
                 break
             logger.debug("  Página %s: %sx%s", page_num + 1, page.width, page.height)
 
-            page_tables = page.extract_tables()
-
-            if not page_tables:
-                logger.info("  Tentando extração com settings customizados...")
-                try:
-                    page_tables = page.extract_tables(
-                        {
-                            "vertical_strategy": "text",
-                            "horizontal_strategy": "text",
-                            "snap_tolerance": 5,
-                            "join_tolerance": 5,
-                            "edge_min_length": 3,
-                        }
-                    )
-                except Exception as e:
-                    logger.warning(f"  Erro na extração customizada: {str(e)}")
-                    page_tables = []
-
-            if not page_tables:
-                logger.info("  Tentando extração de texto estruturado...")
-                text = page.extract_text()
-                if text:
-                    lines = [line.strip() for line in text.split("\n") if line.strip()]
-                    if lines:
-                        page_tables = [[[line] for line in lines]]
-                        logger.info(f"  Extraído {len(lines)} linhas de texto")
+            page_tables = _extract_page_tables_multi_strategy(page)
 
             if page_tables:
-                for table_idx, table in enumerate(page_tables):
-                    processed_rows = []
-                    for row in table:
-                        processed_row = []
-                        for cell in row:
-                            if cell is None:
-                                processed_row.append("")
-                            elif isinstance(cell, str):
-                                cleaned = cell.strip().replace("\n", " ")
-                                processed_row.append(cleaned)
-                            else:
-                                processed_row.append(str(cell))
-                        processed_rows.append(processed_row)
-
+                for table_idx, processed_rows in enumerate(page_tables):
                     tables.append(
                         {
                             "page": page_num + 1,
                             "table_id": f"page_{page_num}_table_{table_idx}",
                             "rows": processed_rows,
-                            "original_rows": len(table),
-                            "columns": len(table[0]) if table else 0,
+                            "original_rows": len(processed_rows),
+                            "columns": len(processed_rows[0]) if processed_rows else 0,
                         }
                     )
                     logger.info(
-                        f"  ✓ Tabela {table_idx + 1}: {len(processed_rows)} linhas x {len(table[0]) if table else 0} colunas"
+                        "  ✓ Tabela %s: %s linhas x %s colunas",
+                        table_idx + 1,
+                        len(processed_rows),
+                        len(processed_rows[0]) if processed_rows else 0,
                     )
             else:
-                logger.warning(f"  ⚠️  Nenhuma tabela encontrada na página {page_num + 1}")
+                logger.warning("  ⚠️  Nenhuma tabela encontrada na página %s", page_num + 1)
 
     return tables
 
@@ -764,11 +814,46 @@ def _count_nonempty_table_rows(rows: List[List[Any]]) -> int:
 
 
 _BUDGET_HEADER_HINTS: Dict[str, List[str]] = {
-    "descricao": ["descrição", "descricao", "serviço", "servico", "do serviço", "do servico"],
-    "quantidade": ["qtde", "quant", "quantidade", "qtd"],
-    "valor": ["preço unit", "preco unit", "valor unit", "p. unit", "p.unit", "unitário", "unitario", "preço total", "preco total"],
-    "codigo": ["código", "codigo", "code"],
-    "bdi": ["bdi", "% bdi"],
+    "descricao": [
+        "descrição",
+        "descricao",
+        "serviço",
+        "servico",
+        "do serviço",
+        "do servico",
+        "especificação",
+        "especificacao",
+    ],
+    "quantidade": ["qtde", "qtde.", "quant", "quantidade", "qtd", "qtd."],
+    "valor": [
+        "preço unit",
+        "preco unit",
+        "valor unit",
+        "p. unit",
+        "p.unit",
+        "unitário",
+        "unitario",
+        "preço total",
+        "preco total",
+        "valor total",
+    ],
+    "codigo": ["código", "codigo", "code", "item", "fonte"],
+    "bdi": ["bdi", "% bdi", "b.d.i"],
+    "unidade": ["unid.", "unid", "und.", "und", "unidade"],
+}
+_PDFPLUMBER_TEXT_TABLE_SETTINGS = {
+    "vertical_strategy": "text",
+    "horizontal_strategy": "text",
+    "snap_tolerance": 5,
+    "join_tolerance": 5,
+    "edge_min_length": 3,
+}
+_PDFPLUMBER_LINES_TABLE_SETTINGS = {
+    "vertical_strategy": "lines",
+    "horizontal_strategy": "lines",
+    "snap_tolerance": 5,
+    "join_tolerance": 5,
+    "edge_min_length": 3,
 }
 _EDITAL_NOISE_KEYWORDS = (
     "licitação",
@@ -816,12 +901,15 @@ def _score_budget_table_likelihood(rows: List[List[Any]]) -> int:
         has_val = any(k in row_text for k in _BUDGET_HEADER_HINTS["valor"])
         has_cod = any(k in row_text for k in _BUDGET_HEADER_HINTS["codigo"])
         has_bdi = any(k in row_text for k in _BUDGET_HEADER_HINTS["bdi"])
+        has_unit = any(k in row_text for k in _BUDGET_HEADER_HINTS["unidade"])
         if has_desc and (has_qtd or has_val):
             score += 28
         if has_cod and (has_qtd or has_val):
             score += 22
         if has_bdi and has_cod:
             score += 12
+        if has_unit and has_qtd and has_cod:
+            score += 10
 
     code_rows = 0
     for row in rows[1 : min(45, len(rows))]:
@@ -929,6 +1017,7 @@ def _items_from_rows_fallback(rows: List[List[Any]], page: int) -> List[Dict[str
     parser = BudgetParser()
     parsed_items, _ = parser.parse_table(rows, page)
     fallback: List[Dict[str, Any]] = []
+    template_sem_precos = _rows_likely_missing_prices(rows)
     for idx, it in enumerate(parsed_items, start=1):
         if not isinstance(it, dict):
             continue
@@ -938,34 +1027,41 @@ def _items_from_rows_fallback(rows: List[List[Any]], page: int) -> List[Dict[str
         q = _coerce_number(it.get("quantidade"))
         vu = _coerce_number(it.get("valor_unitario"))
         vt = _coerce_number(it.get("valor_total"))
+        bdi = _coerce_bdi(it.get("bdi"))
         if vt <= 0 and q > 0 and vu > 0:
             vt = q * vu
         if q <= 0 and vu <= 0 and vt <= 0:
             continue
+        alertas: List[str] = []
+        if template_sem_precos and vu <= 0 and vt <= 0:
+            alertas.append("Preços em branco no edital — preencha manualmente ou use catálogo")
         fallback.append(
             {
                 "item": str(idx),
                 "tipo": "item",
                 "banco": "",
-                "codigo": "",
+                "codigo": str(it.get("codigo") or "").strip(),
                 "descricao": descricao,
-                "bdi": 0.0,
+                "bdi": bdi,
                 "unidade": str(it.get("unidade") or "un"),
                 "quantidade": q,
                 "valor_unitario": vu,
                 "valor_total": vt,
+                "origem_extracao": "parser_local",
+                "alertas": alertas,
             }
         )
     return fallback
 
 
 def _deduplicate_orcamento_items(items: List[Any]) -> List[Dict[str, Any]]:
-    """Remove itens repetidos após merge de várias tabelas (mesma página)."""
-    seen: set[tuple[str, str, float, float]] = set()
+    """Remove itens repetidos após merge de várias tabelas (preserva tabelas distintas)."""
+    seen: set[tuple[str, str, str, float, float]] = set()
     result: List[Dict[str, Any]] = []
     for raw in items:
         if not isinstance(raw, dict):
             continue
+        source = str(raw.get("_source_table_id") or raw.get("_source_page") or "").strip().lower()
         codigo = str(raw.get("codigo") or raw.get("code") or "").strip().lower()
         descricao = str(raw.get("descricao") or raw.get("description") or "").strip().lower()[:120]
         quantidade = round(_coerce_number(raw.get("quantidade") or raw.get("qty")), 4)
@@ -973,7 +1069,7 @@ def _deduplicate_orcamento_items(items: List[Any]) -> List[Dict[str, Any]]:
             _coerce_number(raw.get("valor_unitario") or raw.get("unitPrice") or raw.get("unit_value")),
             2,
         )
-        key = (codigo, descricao, quantidade, valor_unitario)
+        key = (source, codigo, descricao, quantidade, valor_unitario)
         if key in seen:
             continue
         if not codigo and not descricao:
@@ -1151,6 +1247,31 @@ def _page_thumbnail_base64(
         doc.close()
 
 
+def _dedupe_budget_table_candidates(
+    scored: List[Tuple[int, Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Mantém a melhor tabela por página (evita duplicata entre estratégias de extração)."""
+    by_page: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
+    for score, entry in scored:
+        page_num = int(entry.get("pagina") or 0)
+        by_page.setdefault(page_num, []).append((score, entry))
+
+    def ranking_value(entry: Dict[str, Any]) -> float:
+        score = int(entry.get("budget_score") or 0)
+        rows = int(entry.get("row_count") or 0)
+        return score + min(rows, 60)
+
+    deduped: List[Dict[str, Any]] = []
+    for page_num in sorted(by_page):
+        page_items = sorted(
+            by_page[page_num],
+            key=lambda item: ranking_value(item[1]),
+            reverse=True,
+        )
+        deduped.append(page_items[0][1])
+    return deduped
+
+
 def _pdfplumber_detect_options(
     file_path: Path,
     min_nonempty_rows: int = 8,
@@ -1167,9 +1288,10 @@ def _pdfplumber_detect_options(
     for table in all_tables:
         rows = table.get("rows") or []
         nonempty = _count_nonempty_table_rows(rows)
-        if nonempty < min_nonempty_rows:
-            continue
         budget_score = _score_budget_table_likelihood(rows)
+        min_rows_required = 4 if budget_score >= 35 else min_nonempty_rows
+        if nonempty < min_rows_required:
+            continue
         page_num = int(table.get("page") or 1)
         table_id = str(table.get("table_id") or f"page_{page_num}_table_0")
         preview = _preview_text_for_table_rows(rows)
@@ -1194,8 +1316,9 @@ def _pdfplumber_detect_options(
         )
 
     likely = [entry for score, entry in scored if score >= 18]
-    fallback_limit = min(12, DETECT_TABLES_MAX_CANDIDATES)
+    fallback_limit = min(20, DETECT_TABLES_MAX_CANDIDATES)
     options = likely if likely else [entry for _, entry in sorted(scored, key=lambda x: -x[0])[:fallback_limit]]
+    options = _dedupe_budget_table_candidates([(int(o.get("budget_score") or 0), o) for o in options])
     if len(options) > DETECT_TABLES_MAX_CANDIDATES:
         options = options[:DETECT_TABLES_MAX_CANDIDATES]
     if not likely and options:
@@ -1204,7 +1327,11 @@ def _pdfplumber_detect_options(
             len(options),
         )
     options.sort(
-        key=lambda o: (-int(o.get("budget_score") or 0), -int(o.get("row_count") or 0))
+        key=lambda o: (
+            int(o.get("pagina") or 0),
+            -int(o.get("budget_score") or 0),
+            -int(o.get("row_count") or 0),
+        )
     )
 
     thumb_cache: Dict[int, str] = {}
@@ -1856,7 +1983,8 @@ async def detect_orcamento_tables(
 
     upload_data = _get_upload_data_from_sources(upload_id) or {}
     cached_options = upload_data.get("table_candidates") or []
-    if cached_options:
+    cached_version = int(upload_data.get("table_candidates_version") or 0)
+    if cached_options and cached_version >= DETECT_TABLES_CACHE_VERSION:
         return {
             "status": "success",
             "upload_id": upload_id,
@@ -1874,6 +2002,7 @@ async def detect_orcamento_tables(
 
     _OFFLINE_CACHE.setdefault(upload_id, {})
     _OFFLINE_CACHE[upload_id]["table_candidates"] = options
+    _OFFLINE_CACHE[upload_id]["table_candidates_version"] = DETECT_TABLES_CACHE_VERSION
     _OFFLINE_CACHE[upload_id]["uploadId"] = upload_id
     _OFFLINE_CACHE[upload_id]["userId"] = user_id
     if meta.get("filename"):
@@ -2109,21 +2238,23 @@ async def _execute_process_confirmed(
 
         candidate_name = str((selected_candidate or {}).get("nome_tabela") or "")
         table_image_b64 = (selected_candidate or {}).get("imagem_base64")
-        if _rows_likely_missing_prices(rows):
+        template_sem_precos = _rows_likely_missing_prices(rows)
+        parser_items = _items_from_rows_fallback(rows, page)
+        if template_sem_precos:
             logger.info(
-                "Colunas de preço vazias em %s (pág %s) — IA usará página inteira",
+                "Colunas de preço vazias em %s (pág %s) — parser local como base estrutural",
                 t_id,
                 page,
             )
-            table_image_b64 = None
 
         logger.info(
-            "Processando candidato %s → %s na página %s (%s linhas, imagem=%s)",
+            "Processando candidato %s → %s na página %s (%s linhas, imagem=%s, parser=%s itens)",
             t_id,
             resolved_table_id,
             page,
             len(rows),
             bool(table_image_b64),
+            len(parser_items),
         )
 
         tables_out.append({
@@ -2153,7 +2284,7 @@ async def _execute_process_confirmed(
                     page,
                     len(rows),
                 )
-                items_this_table = _items_from_rows_fallback(rows, page)
+                items_this_table = parser_items
                 if items_this_table:
                     ia_metadata_list.append(
                         {
@@ -2162,26 +2293,44 @@ async def _execute_process_confirmed(
                             "resumo": {"total_items": len(items_this_table)},
                         }
                     )
+            elif template_sem_precos and parser_items and (
+                _items_all_missing_prices(items_this_table)
+                or len(items_this_table) < len(parser_items)
+            ):
+                logger.info(
+                    "Mesclando parser local (%s itens) com IA (%s itens) em %s",
+                    len(parser_items),
+                    len(items_this_table),
+                    t_id,
+                )
+                items_this_table = merge_parser_as_primary(parser_items, items_this_table)
+                ia_metadata_list.append(
+                    {
+                        "table_id": resolved_table_id,
+                        "provider": "local:parser_primary_hibrido",
+                        "resumo": {"total_items": len(items_this_table)},
+                    }
+                )
             elif _items_all_missing_prices(items_this_table):
                 logger.warning(
                     "IA retornou itens sem preços para %s (pág %s). Tentando parser local.",
                     t_id,
                     page,
                 )
-                parser_items = _items_from_rows_fallback(rows, page)
-                if parser_items and not _items_all_missing_prices(parser_items):
-                    items_this_table = parser_items
+                if parser_items:
+                    items_this_table = merge_parser_as_primary(parser_items, items_this_table)
                     ia_metadata_list.append(
                         {
                             "table_id": resolved_table_id,
                             "provider": "local:budget_parser_fallback_prices",
-                            "resumo": {"total_items": len(parser_items)},
+                            "resumo": {"total_items": len(items_this_table)},
                         }
                     )
 
             for raw_item in items_this_table:
                 if isinstance(raw_item, dict):
                     raw_item.setdefault("_source_table_id", t_id)
+                    raw_item.setdefault("_source_page", page)
             combined_items.extend(items_this_table)
             for raw_item in hierarchical_this_table:
                 if isinstance(raw_item, dict):
