@@ -33,6 +33,7 @@ from config import (
     DETECT_TABLES_CACHE_VERSION,
     DETECT_TABLES_MAX_PAGES,
     DETECT_TABLES_THUMB_SCALE,
+    DISABLE_CAMELOT,
     ENVIRONMENT,
     GEMINI_API_KEY,
     GEMINI_MODEL,
@@ -1955,6 +1956,12 @@ def _detect_table_options_sync(file_path: Path) -> Tuple[List[Dict[str, Any]], b
     if options:
         logger.info("detect-tables: %s candidato(s) via pdfplumber", len(options))
         return options, False
+
+    if DISABLE_CAMELOT:
+        logger.warning(
+            "detect-tables: pdfplumber vazio e Camelot desativado (DISABLE_CAMELOT)"
+        )
+        return [], False
 
     logger.info("detect-tables: pdfplumber vazio — tentando Camelot (máx. %s págs)", DETECT_TABLES_MAX_PAGES)
     try:
