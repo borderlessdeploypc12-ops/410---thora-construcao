@@ -139,7 +139,12 @@ USE_CELERY_QUEUE = os.getenv("USE_CELERY_QUEUE", _default_use_celery).lower() in
     "on",
 ) and bool(CELERY_BROKER_URL) and not IS_VERCEL
 
-if GEMINI_API_KEY:
+if GEMINI_API_KEY and GEMINI_API_KEY.strip().lower() not in {"", "sua-chave-aqui", "sua-chave", "..."}:
     print("GEMINI_API_KEY carregada")
 else:
-    print("AVISO: GEMINI_API_KEY não encontrada no .env")
+    print("AVISO: GEMINI_API_KEY não encontrada ou inválida no .env")
+
+if OPENAI_API_KEY and OPENAI_API_KEY.strip().lower() not in {"", "sua-chave-aqui", "..."}:
+    print("OPENAI_API_KEY carregada")
+elif not GEMINI_API_KEY or GEMINI_API_KEY.strip().lower() in {"", "sua-chave-aqui", "sua-chave", "..."}:
+    print("AVISO: configure OPENAI_API_KEY ou GEMINI_API_KEY no .env para extração de PDF com IA")

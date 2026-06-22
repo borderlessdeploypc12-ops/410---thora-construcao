@@ -2464,7 +2464,7 @@ async def _execute_process_confirmed(
             status = getattr(exc, "status_code", 500) or 500
             raise HTTPException(
                 status_code=status,
-                detail=f"Erro OpenAI na tabela {t_id}: {str(exc)}",
+                detail=f"Erro na extração IA da tabela {t_id}: {str(exc)}",
             )
         except Exception as exc:
             logger.warning(f"Erro inesperado ao processar tabela {t_id}: {exc}")

@@ -15,10 +15,13 @@ import time
 from io import BytesIO
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import httpx
 import pdfplumber
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, BadRequestError, OpenAIError, RateLimitError
 
 from config import (
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
     OPENAI_API_KEY,
     OPENAI_MODEL,
     OPENAI_ORCAMENTO_MODEL,
@@ -236,13 +239,151 @@ class OpenAIServiceError(Exception):
         self.code = code
 
 
+_PLACEHOLDER_API_KEYS = frozenset(
+    {
+        "",
+        "sua-chave-aqui",
+        "sua-chave",
+        "your-key-here",
+        "changeme",
+        "...",
+    }
+)
+
+_GEMINI_CANDIDATE_MODELS = [
+    GEMINI_MODEL,
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro-latest",
+]
+
+
+def _is_valid_api_key(key: str | None) -> bool:
+    normalized = (key or "").strip().lower()
+    return bool(normalized) and normalized not in _PLACEHOLDER_API_KEYS
+
+
+def _has_openai_key() -> bool:
+    return _is_valid_api_key(OPENAI_API_KEY)
+
+
+def _has_gemini_key() -> bool:
+    return _is_valid_api_key(GEMINI_API_KEY)
+
+
+def _resolve_extraction_provider() -> str:
+    if _has_openai_key():
+        return "openai"
+    if _has_gemini_key():
+        return "gemini"
+    raise OpenAIServiceError(
+        "Nenhuma chave de IA configurada. Defina OPENAI_API_KEY ou GEMINI_API_KEY no arquivo .env na raiz do projeto.",
+        status_code=503,
+        code="missing_api_key",
+    )
+
+
 def _ensure_api_key() -> None:
-    if not OPENAI_API_KEY.strip():
+    _resolve_extraction_provider()
+
+
+async def _call_gemini_json(
+    *,
+    system_msg: str,
+    user_text: str,
+    base64_image: str | None = None,
+    image_mime: str = "image/jpeg",
+    timeout_seconds: float = OPENAI_ORCAMENTO_TIMEOUT_SECONDS,
+) -> Tuple[str, str]:
+    if not _has_gemini_key():
         raise OpenAIServiceError(
-            "OPENAI_API_KEY ausente. Configure a chave no ambiente para habilitar a extração via GPT-4o.",
+            "GEMINI_API_KEY ausente ou inválida.",
             status_code=503,
             code="missing_api_key",
         )
+
+    parts: List[Dict[str, Any]] = [{"text": user_text}]
+    if base64_image:
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": image_mime,
+                    "data": base64_image.strip(),
+                }
+            }
+        )
+
+    request_body = {
+        "system_instruction": {"parts": [{"text": system_msg}]},
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 8192,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    attempted_models: List[str] = []
+    last_error_body = ""
+
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        for model in _GEMINI_CANDIDATE_MODELS:
+            if not model or model in attempted_models:
+                continue
+            attempted_models.append(model)
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                f"?key={GEMINI_API_KEY.strip()}"
+            )
+            try:
+                response = await client.post(url, json=request_body)
+            except httpx.HTTPError as exc:
+                raise OpenAIServiceError(
+                    f"Falha de conexão com o Gemini: {exc}",
+                    status_code=503,
+                    code="connection_error",
+                ) from exc
+
+            if response.status_code < 400:
+                response_data = response.json()
+                candidates = response_data.get("candidates") or []
+                if not candidates:
+                    raise OpenAIServiceError(
+                        "Gemini retornou resposta vazia.",
+                        status_code=502,
+                        code="invalid_response",
+                    )
+                parts_out = candidates[0].get("content", {}).get("parts") or []
+                content = "".join(
+                    str(part.get("text") or "") for part in parts_out if isinstance(part, dict)
+                ).strip()
+                if not content:
+                    raise OpenAIServiceError(
+                        "Gemini retornou conteúdo vazio.",
+                        status_code=502,
+                        code="invalid_response",
+                    )
+                return content, f"gemini:{model}"
+
+            last_error_body = response.text
+            if response.status_code in (404, 429, 500, 502, 503, 504):
+                continue
+            raise OpenAIServiceError(
+                f"Erro do Gemini (status {response.status_code}): {response.text}",
+                status_code=502,
+                code="provider_error",
+            )
+
+    raise OpenAIServiceError(
+        (
+            "Nenhum modelo Gemini respondeu à extração. "
+            f"Modelos tentados: {', '.join(attempted_models)}. "
+            f"Último erro: {last_error_body}"
+        ),
+        status_code=503,
+        code="provider_error",
+    )
 
 
 def _get_client() -> AsyncOpenAI:
@@ -488,6 +629,34 @@ async def _extract_with_openai_vision(
     return normalized_items, parsed if isinstance(parsed, dict) else {}, raw_content
 
 
+async def _extract_with_gemini_vision(
+    *,
+    system_msg: str,
+    user_msg: str,
+    base64_image: str | None = None,
+    image_mime: str = "image/jpeg",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str, str]:
+    if base64_image:
+        user_text = (
+            f"{EXTRACTION_USER_PROMPT_HEADER}\n\n"
+            "CONTEXTO DE TEXTO EXTRAÍDO (pode estar incompleto — a imagem é a fonte da verdade para preços):\n"
+            f"{user_msg}"
+        )
+    else:
+        user_text = f"{EXTRACTION_USER_PROMPT_HEADER}\n\nCONTEXTO DA TABELA:\n{user_msg}"
+
+    raw_content, model_label = await _call_gemini_json(
+        system_msg=system_msg,
+        user_text=user_text,
+        base64_image=base64_image,
+        image_mime=image_mime,
+    )
+    parsed = _parse_json_content(raw_content)
+    raw_items = parsed.get("orcamento_itens") if isinstance(parsed, dict) else []
+    normalized_items = _normalize_structured_items(raw_items)
+    return normalized_items, parsed if isinstance(parsed, dict) else {}, raw_content, model_label
+
+
 def _resolve_tipo_linha(item: Dict[str, Any]) -> str:
     tipo = str(
         item.get("tipo_linha")
@@ -662,7 +831,7 @@ async def identify_tables(pdf_content: bytes) -> List[Dict[str, Any]]:
     Identifica tabelas candidatas usando apenas as páginas iniciais do PDF.
     Retorna lista de objetos com id, nome_tabela, num_pagina e preview_texto.
     """
-    _ensure_api_key()
+    provider = _resolve_extraction_provider()
     t0 = time.perf_counter()
     page_snippets = _extract_page_snippets(pdf_content)
     if not page_snippets:
@@ -674,24 +843,36 @@ async def identify_tables(pdf_content: bytes) -> List[Dict[str, Any]]:
 
     system_msg = DETECTION_SYSTEM_PROMPT
     user_msg = _build_detection_prompt(page_snippets)
-    client = _get_client()
     input_audit = {
         "pages": [{"page": snippet["page"], "chars": len(snippet["text"])} for snippet in page_snippets],
+        "provider": provider,
     }
 
     try:
-        response = await client.chat.completions.create(
-            model=OPENAI_ORCAMENTO_MODEL,
-            temperature=0,
-            max_tokens=900,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-        )
+        if provider == "gemini":
+            raw_content, model_label = await _call_gemini_json(
+                system_msg=system_msg,
+                user_text=user_msg,
+            )
+            provider_name = "gemini"
+            model_name = model_label.split(":", 1)[-1]
+        else:
+            client = _get_client()
+            response = await client.chat.completions.create(
+                model=OPENAI_ORCAMENTO_MODEL,
+                temperature=0,
+                max_tokens=900,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+            raw_content = response.choices[0].message.content or "{}"
+            provider_name = "openai"
+            model_name = OPENAI_ORCAMENTO_MODEL
+
         duration_ms = (time.perf_counter() - t0) * 1000
-        raw_content = response.choices[0].message.content or "{}"
         parsed = _parse_json_content(raw_content)
         candidates = _normalize_table_candidates(parsed)
 
@@ -711,8 +892,8 @@ async def identify_tables(pdf_content: bytes) -> List[Dict[str, Any]]:
 
         log_ai_exchange(
             operation="identify_tables",
-            provider="openai",
-            model=OPENAI_ORCAMENTO_MODEL,
+            provider=provider_name,
+            model=model_name,
             input_payload=input_audit,
             output_payload={
                 "tables_found": len(candidates),
@@ -726,6 +907,8 @@ async def identify_tables(pdf_content: bytes) -> List[Dict[str, Any]]:
         )
         return candidates
 
+    except OpenAIServiceError:
+        raise
     except RateLimitError as exc:
         duration_ms = (time.perf_counter() - t0) * 1000
         log_ai_exchange(
@@ -782,11 +965,10 @@ async def process_selected_table(
     table_image_base64: str | None = None,
 ) -> Tuple[Dict[str, Any], str]:
     """
-    Processa a tabela escolhida com GPT-4o e retorna JSON estruturado.
+    Processa a tabela escolhida com IA (OpenAI ou Gemini) e retorna JSON estruturado.
     """
-    _ensure_api_key()
+    provider = _resolve_extraction_provider()
     t0 = time.perf_counter()
-    client = _get_client()
 
     table_structure = detect_table_structure(table_rows)
     system_msg = EXTRACTION_SYSTEM_PROMPT
@@ -819,72 +1001,104 @@ async def process_selected_table(
         "image_source": "crop" if table_image_base64 else "full_page",
         "column_indices": table_structure.get("column_indices"),
         "parser_items_found": len(table_structure.get("parser_items") or []),
+        "provider": provider,
     }
 
-    try:
-        messages = [
-            {"role": "system", "content": system_msg},
-        ]
-        
-        if base64_image:
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"{EXTRACTION_USER_PROMPT_HEADER}\n\nCONTEXTO DE TEXTO EXTRAÍDO (Pode conter erros de alinhamento, use a imagem como fonte da verdade):\n{user_msg}"
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{image_mime};base64,{base64_image}",
-                            "detail": "high"
-                        }
-                    }
-                ]
-            })
-        else:
-            messages.append({
-                "role": "user",
-                "content": f"{EXTRACTION_USER_PROMPT_HEADER}\n\nCONTEXTO DA TABELA:\n{user_msg}"
-            })
+    provider_name = provider
+    model_name = OPENAI_ORCAMENTO_MODEL
 
-        response = await client.chat.completions.create(
-            model=OPENAI_ORCAMENTO_MODEL,
-            temperature=0.0,
-            max_tokens=8192,
-            response_format={"type": "json_schema", "json_schema": EXTRACTION_JSON_SCHEMA},
-            messages=messages,
-        )
-        duration_ms = (time.perf_counter() - t0) * 1000
-        raw_content = response.choices[0].message.content or "{}"
-        
-        # Limpa formatação markdown se houver
-        if raw_content.startswith("```"):
-            raw_content = raw_content.strip("`").removeprefix("json").strip()
-            
-        try:
-            parsed = json.loads(raw_content)
-        except json.JSONDecodeError as e:
-            print("CONTEÚDO QUE FALHOU NO PARSE:", raw_content)
-            import traceback; traceback.print_exc()
-            raise ValueError(f"Falha ao decodificar o JSON retornado pela OpenAI: {e}")
-        raw_items = parsed.get("orcamento_itens") if isinstance(parsed, dict) else []
-        merged_raw = merge_ai_with_parser(
-            [item for item in raw_items if isinstance(item, dict)],
-            table_structure,
-        )
-        hierarchical_items = enrich_hierarchical_items(
-            _normalize_hierarchical_items(merged_raw or raw_items)
-        )
-        normalized_items = _normalize_structured_items(merged_raw or raw_items)
-        if not normalized_items and hierarchical_items:
-            normalized_items = [
-                row for row in hierarchical_items if row.get("tipo_linha") == "item"
+    try:
+        if provider == "gemini":
+            normalized_items, parsed, raw_content, model_label = await _extract_with_gemini_vision(
+                system_msg=system_msg,
+                user_msg=user_msg,
+                base64_image=base64_image,
+                image_mime=image_mime,
+            )
+            provider_name = "gemini"
+            model_name = model_label.split(":", 1)[-1]
+        else:
+            client = _get_client()
+            messages = [
+                {"role": "system", "content": system_msg},
             ]
+            
+            if base64_image:
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"{EXTRACTION_USER_PROMPT_HEADER}\n\nCONTEXTO DE TEXTO EXTRAÍDO (Pode conter erros de alinhamento, use a imagem como fonte da verdade):\n{user_msg}"
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{image_mime};base64,{base64_image}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": f"{EXTRACTION_USER_PROMPT_HEADER}\n\nCONTEXTO DA TABELA:\n{user_msg}"
+                })
+
+            response = await client.chat.completions.create(
+                model=OPENAI_ORCAMENTO_MODEL,
+                temperature=0.0,
+                max_tokens=8192,
+                response_format={"type": "json_schema", "json_schema": EXTRACTION_JSON_SCHEMA},
+                messages=messages,
+            )
+            raw_content = response.choices[0].message.content or "{}"
+            
+            if raw_content.startswith("```"):
+                raw_content = raw_content.strip("`").removeprefix("json").strip()
+                
+            try:
+                parsed = json.loads(raw_content)
+            except json.JSONDecodeError as e:
+                print("CONTEÚDO QUE FALHOU NO PARSE:", raw_content)
+                import traceback; traceback.print_exc()
+                raise ValueError(f"Falha ao decodificar o JSON retornado pela OpenAI: {e}") from e
+            raw_items = parsed.get("orcamento_itens") if isinstance(parsed, dict) else []
+            merged_raw = merge_ai_with_parser(
+                [item for item in raw_items if isinstance(item, dict)],
+                table_structure,
+            )
+            hierarchical_items = enrich_hierarchical_items(
+                _normalize_hierarchical_items(merged_raw or raw_items)
+            )
+            normalized_items = _normalize_structured_items(merged_raw or raw_items)
+            if not normalized_items and hierarchical_items:
+                normalized_items = [
+                    row for row in hierarchical_items if row.get("tipo_linha") == "item"
+                ]
+
+        duration_ms = (time.perf_counter() - t0) * 1000
+
+        if provider == "gemini":
+            raw_items = parsed.get("orcamento_itens") if isinstance(parsed, dict) else []
+            merged_raw = merge_ai_with_parser(
+                [item for item in raw_items if isinstance(item, dict)],
+                table_structure,
+            )
+            hierarchical_items = enrich_hierarchical_items(
+                _normalize_hierarchical_items(merged_raw or raw_items)
+            )
+            normalized_items = _normalize_structured_items(merged_raw or raw_items)
+            if not normalized_items and hierarchical_items:
+                normalized_items = [
+                    row for row in hierarchical_items if row.get("tipo_linha") == "item"
+                ]
+
         if not normalized_items and raw_content:
             logger.warning(
-                "OpenAI retornou 0 itens úteis para %s (pág %s). raw_chars=%s snippet=%s",
+                "%s retornou 0 itens úteis para %s (pág %s). raw_chars=%s snippet=%s",
+                provider_name,
                 table_id,
                 table_page,
                 len(raw_content),
@@ -908,13 +1122,22 @@ async def process_selected_table(
                     len(normalized_items),
                     _items_missing_prices(normalized_items),
                 )
-                retry_items, retry_parsed, retry_raw = await _extract_with_openai_vision(
-                    client,
-                    system_msg=system_msg,
-                    user_msg=user_msg,
-                    base64_image=full_page_b64,
-                    image_mime="image/jpeg",
-                )
+                if provider == "gemini":
+                    retry_items, retry_parsed, retry_raw, retry_model = await _extract_with_gemini_vision(
+                        system_msg=system_msg,
+                        user_msg=user_msg,
+                        base64_image=full_page_b64,
+                        image_mime="image/jpeg",
+                    )
+                    model_name = retry_model.split(":", 1)[-1]
+                else:
+                    retry_items, retry_parsed, retry_raw = await _extract_with_openai_vision(
+                        client,
+                        system_msg=system_msg,
+                        user_msg=user_msg,
+                        base64_image=full_page_b64,
+                        image_mime="image/jpeg",
+                    )
                 if retry_items and (
                     not normalized_items
                     or not _items_missing_prices(retry_items)
@@ -942,13 +1165,13 @@ async def process_selected_table(
 
         summary = parsed.get("resumo") if isinstance(parsed, dict) else {}
         if not isinstance(summary, dict):
-            summary = _build_summary(normalized_items, OPENAI_ORCAMENTO_MODEL)
+            summary = _build_summary(normalized_items, model_name)
         else:
             summary = {
                 "total_items": int(summary.get("total_items") or len(normalized_items)),
                 "valor_total": float(summary.get("valor_total") or sum(float(item.get("valor_total") or 0) for item in normalized_items)),
                 "confianca": float(summary.get("confianca") or 0.82),
-                "metodo": str(summary.get("metodo") or OPENAI_ORCAMENTO_MODEL),
+                "metodo": str(summary.get("metodo") or model_name),
             }
 
         structured_output = {
@@ -959,8 +1182,8 @@ async def process_selected_table(
 
         log_ai_exchange(
             operation="process_selected_table",
-            provider="openai",
-            model=OPENAI_ORCAMENTO_MODEL,
+            provider=provider_name,
+            model=model_name,
             input_payload=input_audit,
             output_payload={
                 "items_count": len(normalized_items),
@@ -970,8 +1193,10 @@ async def process_selected_table(
             },
             duration_ms=duration_ms,
         )
-        return structured_output, f"openai:{OPENAI_ORCAMENTO_MODEL}"
+        return structured_output, f"{provider_name}:{model_name}"
 
+    except OpenAIServiceError:
+        raise
     except RateLimitError as exc:
         duration_ms = (time.perf_counter() - t0) * 1000
         log_ai_exchange(
