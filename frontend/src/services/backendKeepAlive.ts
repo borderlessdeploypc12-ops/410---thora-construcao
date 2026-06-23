@@ -1,12 +1,12 @@
-import { getApiBaseUrl, pingApiHealthLight } from "./api";
+import { getApiBaseUrl, wakeApiServer } from "./api";
 
-const DEFAULT_INTERVAL_MS = 30_000;
+const DEFAULT_INTERVAL_MS = 4 * 60 * 1000;
 
 function parseIntervalMs(): number {
   const raw = import.meta.env.VITE_KEEP_ALIVE_INTERVAL_MS;
   if (!raw) return DEFAULT_INTERVAL_MS;
   const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed >= 10_000 ? parsed : DEFAULT_INTERVAL_MS;
+  return Number.isFinite(parsed) && parsed >= 60_000 ? parsed : DEFAULT_INTERVAL_MS;
 }
 
 /** Ativo quando a API aponta para Render (ou forçado via env). */
@@ -17,21 +17,9 @@ export function shouldEnableBackendKeepAlive(apiBase = getApiBaseUrl()): boolean
   return /\.onrender\.com/i.test(apiBase);
 }
 
-function wakeWithImage(apiBase: string): void {
-  const base = apiBase.replace(/\/$/, "");
-  const img = new Image();
-  img.referrerPolicy = "no-referrer";
-  img.src = `${base}/health?keepalive=${Date.now()}`;
-}
-
-async function sendKeepAlivePing(apiBase: string): Promise<void> {
-  wakeWithImage(apiBase);
-  await pingApiHealthLight();
-}
-
 /**
- * Inicia pings periódicos em GET /health para evitar sleep do Render free tier.
- * Retorna função de cleanup (clearInterval).
+ * Inicia pings periódicos leves (só Image, sem XHR) para reduzir sleep do Render.
+ * Evita axios em /health no intervalo — durante 502 o proxy não manda CORS e polui o console.
  */
 export function startBackendKeepAlive(options?: {
   intervalMs?: number;
@@ -44,17 +32,12 @@ export function startBackendKeepAlive(options?: {
   }
 
   const intervalMs = options?.intervalMs ?? parseIntervalMs();
-  let inFlight = false;
 
   const tick = () => {
-    if (inFlight) return;
-    inFlight = true;
-    void sendKeepAlivePing(apiBase).finally(() => {
-      inFlight = false;
-    });
+    wakeApiServer();
   };
 
-  void tick();
+  tick();
   const timerId = window.setInterval(tick, intervalMs);
 
   if (import.meta.env.DEV) {

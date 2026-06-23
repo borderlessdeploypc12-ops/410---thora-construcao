@@ -64,13 +64,16 @@ console.info(`🌐 API Base: ${API_BASE}`);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Acorda o Render sem depender de CORS (GET simples via Image). */
-const wakeApiServer = (): void => {
+export const wakeApiServer = (): void => {
   const base = API_BASE.replace(/\/$/, "");
-  for (let i = 0; i < 3; i++) {
-    const img = new Image();
-    img.referrerPolicy = "no-referrer";
-    img.src = `${base}/health?wake=${Date.now()}-${i}`;
-  }
+  const img = new Image();
+  img.referrerPolicy = "no-referrer";
+  img.src = `${base}/health?wake=${Date.now()}`;
+};
+
+const isHealthRequest = (url?: string): boolean => {
+  if (!url) return false;
+  return url === "/health" || url.endsWith("/health") || url.includes("/health?");
 };
 
 const isRenderColdStartError = (error: unknown): boolean => {
@@ -81,7 +84,14 @@ const isRenderColdStartError = (error: unknown): boolean => {
   };
   const status = err.response?.status;
   if (status === 502 || status === 503 || status === 504) return true;
-  if (!err.response && (err.code === "ERR_NETWORK" || err.message?.includes("Network Error"))) {
+  const message = err.message ?? "";
+  if (
+    !err.response &&
+    (err.code === "ERR_NETWORK" ||
+      message.includes("Network Error") ||
+      message.includes("ERR_FAILED") ||
+      message.includes("502"))
+  ) {
     return true;
   }
   return false;
@@ -132,8 +142,9 @@ const parseApiError = (error: unknown, fallback: string): string => {
   }
   if (isRenderColdStartError(error)) {
     return (
-      "Servidor da API indisponível (503). No Render free tier ele dorme após inatividade — " +
-      "aguarde ~30s e tente novamente. Se persistir, abra a URL da API /health no navegador."
+      "Servidor da API no Render está acordando ou indisponível (502/503). " +
+      "Aguarde 30–60 segundos e tente novamente. " +
+      `Se persistir, abra ${API_BASE.replace(/\/$/, "")}/health até ver \"online\".`
     );
   }
   return fallback;
@@ -169,6 +180,7 @@ export const apiClient = axios.create({
 
 type RetryAxiosConfig = typeof apiClient extends { request: infer R } ? Parameters<R>[0] & {
   __coldStartRetryCount?: number;
+  __skipColdStartRetry?: boolean;
 } : never;
 
 // Retry automático quando o Render está acordando (502/503 sem header CORS).
@@ -182,7 +194,12 @@ apiClient.interceptors.response.use(
       message?: string;
     };
     const config = err.config;
-    if (!config || !isRenderColdStartError(error)) {
+    if (!config || config.__skipColdStartRetry || !isRenderColdStartError(error)) {
+      return Promise.reject(error);
+    }
+
+    const contentType = String(config.headers?.["Content-Type"] ?? "");
+    if (contentType.includes("multipart/form-data")) {
       return Promise.reject(error);
     }
 
@@ -193,9 +210,9 @@ apiClient.interceptors.response.use(
 
     config.__coldStartRetryCount = retryCount + 1;
     wakeApiServer();
-    await sleep(2500 + retryCount * 3000);
+    await sleep(4000 + retryCount * 4000);
     if (retryCount === 0) {
-      await pingApiHealth(10);
+      await pingApiHealth(12);
     }
     return apiClient.request(config);
   },
@@ -203,64 +220,90 @@ apiClient.interceptors.response.use(
 
 // Attach Firebase ID token to protect backend endpoints.
 apiClient.interceptors.request.use(async (config) => {
-  await waitForAuthReady();
-  config.headers = config.headers ?? {};
-  (config.headers as any)["X-Anonymous-User"] = getRequestUserId();
+  const healthOnly = isHealthRequest(config.url);
+  if (!healthOnly) {
+    await waitForAuthReady();
+  }
 
-  try {
-    const token = await ensureAuthToken();
-    if (token) {
-      (config.headers as any).Authorization = `Bearer ${token}`;
-    }
-  } catch (error) {
-    const code = (error as { code?: string })?.code;
-    if (code === "auth/quota-exceeded") {
-      console.warn(
-        "Cota Firebase Auth excedida; usando UID da sessão e token em cache se houver.",
-        error,
-      );
-      try {
-        const cachedToken = await ensureAuthToken(false);
-        if (cachedToken) {
-          (config.headers as any).Authorization = `Bearer ${cachedToken}`;
-        }
-      } catch {
-        /* backend aceita X-Anonymous-User com UID Firebase */
+  config.headers = config.headers ?? {};
+  if (!healthOnly) {
+    (config.headers as any)["X-Anonymous-User"] = getRequestUserId();
+
+    try {
+      const token = await ensureAuthToken();
+      if (token) {
+        (config.headers as any).Authorization = `Bearer ${token}`;
       }
-    } else if (!getAuthenticatedUserId()) {
-      console.warn("Falha ao obter token Firebase; usando fallback anônimo.", error);
+    } catch (error) {
+      const code = (error as { code?: string })?.code;
+      if (code === "auth/quota-exceeded") {
+        console.warn(
+          "Cota Firebase Auth excedida; usando UID da sessão e token em cache se houver.",
+          error,
+        );
+        try {
+          const cachedToken = await ensureAuthToken(false);
+          if (cachedToken) {
+            (config.headers as any).Authorization = `Bearer ${cachedToken}`;
+          }
+        } catch {
+          /* backend aceita X-Anonymous-User com UID Firebase */
+        }
+      } else if (!getAuthenticatedUserId()) {
+        console.warn("Falha ao obter token Firebase; usando fallback anônimo.", error);
+      }
     }
   }
 
   return config;
 });
 
-/** Ping leve em /health (keep-alive periódico, sem retries). */
+/** Ping leve em /health (sem auth; evita ruído de CORS durante cold start). */
 export const pingApiHealthLight = async (): Promise<boolean> => {
   try {
-    const response = await apiClient.get("/health", { timeout: 15000 });
+    const response = await apiClient.get("/health", { timeout: 20000 });
     return response.data?.status === "online";
   } catch {
     return false;
   }
 };
 
+const buildUploadFormData = (file: File): FormData => {
+  const formData = new FormData();
+  formData.append("file", file);
+  return formData;
+};
+
 // ==================== PDF OPERATIONS ====================
 
 // Upload PDF
 export const uploadPDF = async (file: File) => {
-  const formData = new FormData();
-  formData.append("file", file);
-
-  await ensureApiReady();
+  wakeApiServer();
+  await sleep(2000);
 
   let lastError: unknown;
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  for (let attempt = 1; attempt <= 8; attempt++) {
     try {
-      const response = await apiClient.post("/api/upload", formData, {
+      if (attempt > 1) {
+        wakeApiServer();
+        const ready = await pingApiHealth(12);
+        if (!ready) {
+          await sleep(Math.min(attempt * 5000, 20000));
+        }
+      } else {
+        const ready = await pingApiHealth(8);
+        if (!ready) {
+          throw new Error(
+            "Servidor da API ainda está iniciando. Aguarde ~1 minuto e tente novamente.",
+          );
+        }
+      }
+
+      const response = await apiClient.post("/api/upload", buildUploadFormData(file), {
         headers: { "Content-Type": "multipart/form-data" },
-        timeout: 120000,
-      });
+        timeout: 180000,
+        __skipColdStartRetry: true,
+      } as RetryAxiosConfig);
       return response.data;
     } catch (error: unknown) {
       lastError = error;
@@ -268,9 +311,8 @@ export const uploadPDF = async (file: File) => {
       if (err?.code === "ECONNABORTED") {
         throw new Error("Timeout no upload. Verifique conexão/servidor e tente novamente.");
       }
-      if (isRenderColdStartError(error) && attempt < 5) {
-        await sleep(attempt * 5000);
-        await ensureApiReady();
+      if (isRenderColdStartError(error) && attempt < 8) {
+        await sleep(Math.min(attempt * 6000, 30000));
         continue;
       }
       break;
