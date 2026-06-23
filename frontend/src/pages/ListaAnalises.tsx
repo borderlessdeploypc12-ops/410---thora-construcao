@@ -20,14 +20,9 @@ import {
   updateAbcJob,
   type AbcAnalysisJob,
 } from "../services/abcAnalysis";
-import { trackAbcBackgroundJob } from "../features/abc/abcBackgroundJobs";
-import {
-  appendAbcAnalysisUploadId,
-  loadAbcAnalysisUploadIds,
-  saveAbcAnalysisUploadIds,
-} from "../features/abc/abcSession";
+import { appendAbcAnalysisUploadId, loadAbcAnalysisUploadIds, saveAbcAnalysisUploadIds } from "../features/abc/abcSession";
 
-const POLL_MS = 5000;
+const POLL_MS = 8000;
 
 type LocationState = {
   pendingFiles?: File[];
@@ -300,7 +295,6 @@ export default function ListaAnalises() {
     try {
       await enqueueAbcProcess(modalUploadId, selectedTableIds);
       appendAbcAnalysisUploadId(modalUploadId);
-      trackAbcBackgroundJob(modalUploadId);
       toast.success("Análise enfileirada", {
         description: "Visível nesta lista em segundo plano — permanece salva ao concluir.",
       });

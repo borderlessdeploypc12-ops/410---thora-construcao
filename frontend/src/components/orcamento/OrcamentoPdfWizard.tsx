@@ -21,11 +21,7 @@ import {
   registerAbcBatch,
   updateAbcJob,
 } from "../../services/abcAnalysis";
-import {
-  markAbcJobNotified,
-  trackAbcBackgroundJob,
-  untrackAbcBackgroundJob,
-} from "../../features/abc/abcBackgroundJobs";
+import { markAbcJobNotified, untrackAbcBackgroundJob } from "../../features/abc/abcBackgroundJobs";
 import { appendAbcAnalysisUploadId } from "../../features/abc/abcSession";
 import {
   ProcessingQueuePanel,
@@ -290,14 +286,20 @@ export function OrcamentoPdfWizard({
     }
 
     let cancelled = false;
+    let pollFailCount = 0;
 
     const pollJob = async () => {
       try {
         const jobs = (await getAbcBatchStatus([uploadId])) ?? [];
         if (cancelled) return;
 
+        pollFailCount = 0;
         const job = jobs[0];
-        if (!job) return;
+
+        if (!job || job.status === "not_found") {
+          setProcessingDetail("Aguardando confirmação do servidor…");
+          return;
+        }
 
         if (job.status === "queued" || job.status === "processing") {
           const total = job.pages_total ?? job.table_ids?.length ?? 0;
@@ -316,10 +318,14 @@ export function OrcamentoPdfWizard({
           return;
         }
 
+        if (job.status === "awaiting_selection") {
+          setProcessingDetail("Aguardando início da fila de processamento…");
+          return;
+        }
+
         if (job.status === "completed" && job.result) {
           setProgressPercent(100);
           markAbcJobNotified(uploadId);
-          untrackAbcBackgroundJob(uploadId);
           setProcessingDetail("Análise concluída — abrindo validação…");
           await finishWithResult(
             uploadId,
@@ -338,12 +344,17 @@ export function OrcamentoPdfWizard({
           toast.error("Falha ao processar", { description: msg });
         }
       } catch {
-        /* poller global também acompanha */
+        pollFailCount += 1;
+        if (pollFailCount >= 4) {
+          setProcessingDetail(
+            "Servidor instável — aguardando… (evite recarregar a página)",
+          );
+        }
       }
     };
 
     void pollJob();
-    const timer = window.setInterval(() => void pollJob(), 2500);
+    const timer = window.setInterval(() => void pollJob(), 5000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -684,7 +695,7 @@ export function OrcamentoPdfWizard({
 
       await enqueueAbcProcess(uploadId, selectedTableIds);
       appendAbcAnalysisUploadId(uploadId);
-      trackAbcBackgroundJob(uploadId);
+      untrackAbcBackgroundJob(uploadId);
 
       toast.success(
         `${selectedTableIds.length} tabela(s) em análise`,

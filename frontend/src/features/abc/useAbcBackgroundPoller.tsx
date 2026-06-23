@@ -1,7 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { pingApiHealthLight } from "../../services/api";
 import { getAbcBatchStatus, type AbcAnalysisJob } from "../../services/abcAnalysis";
 import {
   loadActiveAbcJobs,
@@ -10,12 +9,12 @@ import {
   wasAbcJobNotified,
 } from "./abcBackgroundJobs";
 
-const POLL_MS = 5000;
+/** Só para toast quando o usuário saiu da tela de processamento. */
+const POLL_MS = 12_000;
 
 export function useAbcBackgroundPoller(): void {
   const navigate = useNavigate();
   const pollingRef = useRef(false);
-  const slowPollRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -29,13 +28,6 @@ export function useAbcBackgroundPoller(): void {
 
       pollingRef.current = true;
       try {
-        const apiUp = await pingApiHealthLight();
-        if (!apiUp || cancelled) {
-          slowPollRef.current = true;
-          return;
-        }
-        slowPollRef.current = false;
-
         const jobs = (await getAbcBatchStatus(uploadIds)) ?? [];
         if (cancelled) return;
 
@@ -43,15 +35,18 @@ export function useAbcBackgroundPoller(): void {
           handleTerminalJob(job, navigate);
         }
 
-        const stillActive = jobs.some((job) =>
-          ["queued", "processing", "uploading", "detecting"].includes(job.status),
+        const terminalIds = new Set(
+          jobs
+            .filter((job) => job.status === "completed" || job.status === "failed")
+            .map((job) => job.upload_id),
         );
-        const tracked = loadActiveAbcJobs();
-        if (!stillActive && tracked.length === 0) {
-          return;
+        for (const uploadId of uploadIds) {
+          if (terminalIds.has(uploadId)) {
+            untrackAbcBackgroundJob(uploadId);
+          }
         }
       } catch {
-        slowPollRef.current = true;
+        /* falha pontual — próximo ciclo tenta de novo */
       } finally {
         pollingRef.current = false;
       }

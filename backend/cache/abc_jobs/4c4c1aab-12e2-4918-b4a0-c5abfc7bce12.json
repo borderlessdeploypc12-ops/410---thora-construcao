@@ -1,0 +1,29 @@
+{
+  "upload_id": "4c4c1aab-12e2-4918-b4a0-c5abfc7bce12",
+  "user_id": "test-e2e-cec4f7858e",
+  "filename": "3 Orçamento SEM Desoneração.pdf",
+  "status": "completed",
+  "message": "Análise concluída — 82 item(ns). Clique para abrir.",
+  "queue_position": 0,
+  "tables_found": 0,
+  "items_found": 82,
+  "pages_total": 3,
+  "pages_done": 3,
+  "table_ids": [
+    "page_1_table_1",
+    "page_2_table_3",
+    "page_3_table_3"
+  ],
+  "result": {
+    "upload_id": "4c4c1aab-12e2-4918-b4a0-c5abfc7bce12",
+    "filename": "3 Orçamento SEM Desoneração.pdf",
+    "items_found": 82,
+    "tables_found": 119,
+    "has_pdf": true,
+    "has_orcamento_cache": true
+  },
+  "error": null,
+  "created_at": "2026-06-23T16:52:50.366979",
+  "completed_at": "2026-06-23T16:55:49.126240",
+  "updated_at": "2026-06-23T16:55:49.126240"
+}

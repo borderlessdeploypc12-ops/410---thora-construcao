@@ -1,6 +1,6 @@
 import { getApiBaseUrl, wakeApiServer } from "./api";
 
-const DEFAULT_INTERVAL_MS = 4 * 60 * 1000;
+const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
 
 function parseIntervalMs(): number {
   const raw = import.meta.env.VITE_KEEP_ALIVE_INTERVAL_MS;

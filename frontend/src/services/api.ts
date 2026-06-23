@@ -198,6 +198,11 @@ apiClient.interceptors.response.use(
       return Promise.reject(error);
     }
 
+    const requestUrl = String(config.url ?? "");
+    if (isHealthRequest(requestUrl) || requestUrl.includes("batch-status")) {
+      return Promise.reject(error);
+    }
+
     const contentType = String(config.headers?.["Content-Type"] ?? "");
     if (contentType.includes("multipart/form-data")) {
       return Promise.reject(error);
@@ -258,10 +263,13 @@ apiClient.interceptors.request.use(async (config) => {
   return config;
 });
 
-/** Ping leve em /health (sem auth; evita ruído de CORS durante cold start). */
+/** Ping leve em /health (sem auth; sem retry em cascata). */
 export const pingApiHealthLight = async (): Promise<boolean> => {
   try {
-    const response = await apiClient.get("/health", { timeout: 20000 });
+    const response = await apiClient.get("/health", {
+      timeout: 20000,
+      __skipColdStartRetry: true,
+    } as RetryAxiosConfig);
     return response.data?.status === "online";
   } catch {
     return false;

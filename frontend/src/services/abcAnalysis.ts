@@ -1,5 +1,8 @@
 import { apiClient } from "./api";
 
+/** Evita cascata de retries/ping durante polling (Render free tier). */
+const ABC_POLL_CONFIG = { __skipColdStartRetry: true } as const;
+
 export type AbcJobStatus =
   | "uploading"
   | "detecting"
@@ -119,9 +122,11 @@ export const listAbcJobs = async (): Promise<AbcAnalysisJob[]> => {
 export const getAbcBatchStatus = async (
   uploadIds: string[],
 ): Promise<AbcAnalysisJob[]> => {
-  const response = await apiClient.post("/api/abc-analysis/batch-status", {
-    upload_ids: uploadIds,
-  });
+  const response = await apiClient.post(
+    "/api/abc-analysis/batch-status",
+    { upload_ids: uploadIds },
+    ABC_POLL_CONFIG,
+  );
   return (response.data as { jobs?: AbcAnalysisJob[] }).jobs ?? [];
 };
 

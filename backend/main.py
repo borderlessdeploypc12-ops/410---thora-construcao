@@ -1137,6 +1137,48 @@ def _deduplicate_orcamento_items(items: List[Any]) -> List[Dict[str, Any]]:
     return result
 
 
+def _candidate_page_number(selected_candidate: Dict[str, Any] | None) -> int:
+    if not selected_candidate:
+        return 1
+    return int(
+        selected_candidate.get("num_pagina")
+        or selected_candidate.get("pagina")
+        or 1
+    )
+
+
+def _cached_rows_for_table_candidate(
+    selected_candidate: Dict[str, Any] | None,
+    *,
+    min_nonempty_rows: int = 3,
+) -> List[List[Any]] | None:
+    """Linhas já detectadas em detect-tables (evita reler o PDF no process-confirmed)."""
+    if not selected_candidate:
+        return None
+    cached_rows = selected_candidate.get("rows")
+    if not isinstance(cached_rows, list) or not cached_rows:
+        return None
+    if _count_nonempty_table_rows(cached_rows) < min_nonempty_rows:
+        return None
+    return cached_rows
+
+
+def _needs_pdf_reextract_for_process(
+    table_candidates: List[Dict[str, Any]],
+    ids_to_process: list[str],
+) -> bool:
+    for t_id in ids_to_process:
+        if not t_id:
+            continue
+        selected = next(
+            (item for item in table_candidates if item.get("id") == t_id),
+            None,
+        )
+        if _cached_rows_for_table_candidate(selected) is None:
+            return True
+    return False
+
+
 def _resolve_rows_for_candidate(
     candidate_id: str,
     selected_candidate: Dict[str, Any] | None,
@@ -2214,33 +2256,14 @@ async def _execute_process_confirmed(
     upload_data = _get_upload_data_from_sources(upload_id) or {}
     table_candidates = upload_data.get("table_candidates") or []
 
-    all_tables: List[Dict] = []
-    try:
-        all_tables = _extract_tables_from_pdf_path(file_path, max_pages=DETECT_TABLES_MAX_PAGES)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Erro ao ler PDF: {exc}") from exc
-
-    camelot_tables = None
-    needs_camelot = any(
-        not (next((c for c in table_candidates if c.get("id") == t_id), {}) or {}).get("rows")
-        for t_id in ids_to_process
-    )
-    if needs_camelot:
-        try:
-            doc = fitz.open(str(file_path))
-            try:
-                page_count = doc.page_count
-            finally:
-                doc.close()
-            pages_spec = f"1-{min(page_count, DETECT_TABLES_MAX_PAGES)}"
-            camelot_tables = _get_camelot().read_pdf(str(file_path), pages=pages_spec, flavor="lattice")
-            logger.info(
-                "Camelot: %s tabela(s) carregadas para process-confirmed (%s)",
-                len(camelot_tables),
-                pages_spec,
-            )
-        except Exception as exc:
-            logger.warning("Camelot indisponível em process-confirmed: %s", exc)
+    if not table_candidates:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cache de tabelas indisponível. Volte ao passo anterior, "
+                "detecte as tabelas novamente e selecione para analisar."
+            ),
+        )
 
     candidate_ids = {str(c.get("id")) for c in table_candidates if c.get("id")}
     unknown_ids = [t_id for t_id in ids_to_process if t_id and t_id not in candidate_ids]
@@ -2253,15 +2276,6 @@ async def _execute_process_confirmed(
             ),
         )
 
-    logger.info("process-confirmed: upload=%s tabelas=%s", upload_id, ids_to_process)
-
-    combined_items = []
-    combined_hierarchical: List[Dict[str, Any]] = []
-    combined_resumo = {"total_items": 0, "valor_total": 0.0, "metodo": "gpt-4o (multi-table)"}
-    ia_metadata_list = []
-    pdf_bytes = file_path.read_bytes()
-    tables_out = []
-
     tables_total = len([t for t in ids_to_process if t])
     update_abc_job(
         upload_id,
@@ -2273,6 +2287,74 @@ async def _execute_process_confirmed(
             else "IA analisando tabelas…"
         ),
     )
+
+    logger.info("process-confirmed: upload=%s tabelas=%s", upload_id, ids_to_process)
+
+    all_tables: List[Dict] = []
+    camelot_tables = None
+    needs_pdf_extract = _needs_pdf_reextract_for_process(table_candidates, ids_to_process)
+
+    if needs_pdf_extract:
+        logger.info(
+            "process-confirmed: cache incompleto para %s — extraindo PDF (fallback)",
+            upload_id,
+        )
+        try:
+            all_tables = _extract_tables_from_pdf_path(
+                file_path,
+                max_pages=DETECT_TABLES_MAX_PAGES,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Erro ao ler PDF: {exc}") from exc
+
+        needs_camelot = any(
+            _cached_rows_for_table_candidate(
+                next((c for c in table_candidates if c.get("id") == t_id), None),
+            )
+            is None
+            for t_id in ids_to_process
+            if t_id
+        )
+        if needs_camelot:
+            try:
+                doc = fitz.open(str(file_path))
+                try:
+                    page_count = doc.page_count
+                finally:
+                    doc.close()
+                pages_spec = f"1-{min(page_count, DETECT_TABLES_MAX_PAGES)}"
+                camelot_tables = _get_camelot().read_pdf(
+                    str(file_path),
+                    pages=pages_spec,
+                    flavor="lattice",
+                )
+                logger.info(
+                    "Camelot: %s tabela(s) carregadas para process-confirmed (%s)",
+                    len(camelot_tables),
+                    pages_spec,
+                )
+            except Exception as exc:
+                logger.warning("Camelot indisponível em process-confirmed: %s", exc)
+    else:
+        logger.info(
+            "process-confirmed: usando cache detect-tables (%s tabela(s), sem reler PDF)",
+            tables_total,
+        )
+
+    combined_items = []
+    combined_hierarchical: List[Dict[str, Any]] = []
+    combined_resumo = {"total_items": 0, "valor_total": 0.0, "metodo": "gpt-4o (multi-table)"}
+    ia_metadata_list = []
+    pdf_bytes: bytes | None = None
+    tables_out = []
+
+    def _pdf_bytes_for_table(*, has_table_image: bool) -> bytes:
+        nonlocal pdf_bytes
+        if has_table_image:
+            return b""
+        if pdf_bytes is None:
+            pdf_bytes = file_path.read_bytes()
+        return pdf_bytes
 
     table_index = 0
     for t_id in ids_to_process:
@@ -2296,14 +2378,10 @@ async def _execute_process_confirmed(
                 detail=f"Tabela {t_id} não encontrada entre as opções detectadas.",
             )
 
-        cached_rows = selected_candidate.get("rows")
-        if cached_rows and _count_nonempty_table_rows(cached_rows) >= 3:
+        cached_rows = _cached_rows_for_table_candidate(selected_candidate)
+        if cached_rows is not None:
             rows = cached_rows
-            page = int(
-                selected_candidate.get("pagina")
-                or selected_candidate.get("num_pagina")
-                or 1
-            )
+            page = _candidate_page_number(selected_candidate)
             resolved_table_id = str(selected_candidate.get("id") or t_id)
             logger.info(
                 "Tabela %s resolvida via cache de detecção (pág %s, %s linhas)",
@@ -2367,7 +2445,7 @@ async def _execute_process_confirmed(
 
         try:
             structured_data, provider_used = await process_selected_table(
-                pdf_bytes,
+                _pdf_bytes_for_table(has_table_image=bool(table_image_b64)),
                 resolved_table_id,
                 table_rows=rows,
                 table_page=page,
@@ -2613,6 +2691,7 @@ class AbcProcessRequest(BaseModel):
 
 def _build_abc_job_status(upload_id: str) -> Dict[str, Any]:
     from services.abc_queue import get_queue_position
+    from services.abc_job import fail_job, get_job
 
     job = get_abc_job(upload_id)
     if not job:
@@ -2623,6 +2702,23 @@ def _build_abc_job_status(upload_id: str) -> Dict[str, Any]:
             "queue_position": 0,
             "tables_found": 0,
         }
+
+    if job.get("status") == "processing":
+        updated_raw = job.get("updated_at") or job.get("created_at")
+        if updated_raw:
+            try:
+                updated_at = datetime.fromisoformat(str(updated_raw))
+                stale_minutes = 25 if IS_RENDER else 45
+                age_sec = (datetime.now() - updated_at).total_seconds()
+                if age_sec > stale_minutes * 60:
+                    msg = (
+                        "Processamento interrompido no servidor (memória ou timeout). "
+                        "Selecione as tabelas e enfileire novamente."
+                    )
+                    fail_job(upload_id, msg)
+                    job = get_job(upload_id) or job
+            except (TypeError, ValueError):
+                pass
 
     position = get_queue_position(upload_id)
     if job.get("status") == "queued" and position > 0:
