@@ -1,25 +1,37 @@
-const ACTIVE_KEY = "abc-active-upload-ids";
-const NOTIFIED_KEY = "abc-notified-upload-ids";
+import { getAuth } from "firebase/auth";
+
+const ACTIVE_KEY_PREFIX = "abc-active-upload-ids";
+const NOTIFIED_KEY_PREFIX = "abc-notified-upload-ids";
+
+function activeKey(): string {
+  const uid = getAuth().currentUser?.uid ?? "anonymous";
+  return `${ACTIVE_KEY_PREFIX}-${uid}`;
+}
+
+function notifiedKey(): string {
+  const uid = getAuth().currentUser?.uid ?? "anonymous";
+  return `${NOTIFIED_KEY_PREFIX}-${uid}`;
+}
 
 export function trackAbcBackgroundJob(uploadId: string): void {
   const ids = loadActiveAbcJobs();
   if (!ids.includes(uploadId)) {
-    sessionStorage.setItem(ACTIVE_KEY, JSON.stringify([...ids, uploadId]));
+    sessionStorage.setItem(activeKey(), JSON.stringify([...ids, uploadId]));
   }
 }
 
 export function untrackAbcBackgroundJob(uploadId: string): void {
   const ids = loadActiveAbcJobs().filter((id) => id !== uploadId);
   if (ids.length > 0) {
-    sessionStorage.setItem(ACTIVE_KEY, JSON.stringify(ids));
+    sessionStorage.setItem(activeKey(), JSON.stringify(ids));
   } else {
-    sessionStorage.removeItem(ACTIVE_KEY);
+    sessionStorage.removeItem(activeKey());
   }
 }
 
 export function loadActiveAbcJobs(): string[] {
   try {
-    const raw = sessionStorage.getItem(ACTIVE_KEY);
+    const raw = sessionStorage.getItem(activeKey());
     if (!raw) return [];
     const parsed = JSON.parse(raw) as unknown;
     return Array.isArray(parsed) ? parsed.filter((id) => typeof id === "string") : [];
@@ -31,7 +43,7 @@ export function loadActiveAbcJobs(): string[] {
 export function markAbcJobNotified(uploadId: string): void {
   const ids = loadNotifiedAbcJobs();
   if (!ids.includes(uploadId)) {
-    sessionStorage.setItem(NOTIFIED_KEY, JSON.stringify([...ids, uploadId]));
+    sessionStorage.setItem(notifiedKey(), JSON.stringify([...ids, uploadId]));
   }
 }
 
@@ -41,7 +53,7 @@ export function wasAbcJobNotified(uploadId: string): boolean {
 
 function loadNotifiedAbcJobs(): string[] {
   try {
-    const raw = sessionStorage.getItem(NOTIFIED_KEY);
+    const raw = sessionStorage.getItem(notifiedKey());
     if (!raw) return [];
     const parsed = JSON.parse(raw) as unknown;
     return Array.isArray(parsed) ? parsed.filter((id) => typeof id === "string") : [];

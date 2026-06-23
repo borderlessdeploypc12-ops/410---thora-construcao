@@ -48,10 +48,44 @@ const decodeJwtExpiryMs = (token: string): number => {
   }
 };
 
+const TOKEN_STORAGE_KEY = "thora_firebase_id_token";
+const TOKEN_EXPIRY_STORAGE_KEY = "thora_firebase_id_token_exp";
+
+const readPersistedIdToken = (): string | null => {
+  try {
+    const token = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+    const exp = Number(sessionStorage.getItem(TOKEN_EXPIRY_STORAGE_KEY) ?? "0");
+    if (!token || !Number.isFinite(exp)) return null;
+    if (exp - TOKEN_REFRESH_MARGIN_MS <= Date.now()) return null;
+    return token;
+  } catch {
+    return null;
+  }
+};
+
+const persistIdToken = (token: string, expiresAt: number) => {
+  try {
+    sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+    sessionStorage.setItem(TOKEN_EXPIRY_STORAGE_KEY, String(expiresAt));
+  } catch {
+    /* quota de storage — ignora */
+  }
+};
+
+const clearPersistedIdToken = () => {
+  try {
+    sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    sessionStorage.removeItem(TOKEN_EXPIRY_STORAGE_KEY);
+  } catch {
+    /* ignora */
+  }
+};
+
 const clearCachedIdToken = () => {
   cachedIdToken = null;
   cachedIdTokenExpiresAt = 0;
   idTokenFetchPromise = null;
+  clearPersistedIdToken();
 };
 
 auth.onAuthStateChanged(() => {
@@ -93,6 +127,17 @@ export const ensureAuthToken = async (forceRefresh = false): Promise<string> => 
     return cachedIdToken;
   }
 
+  if (!forceRefresh) {
+    const persisted = readPersistedIdToken();
+    if (persisted) {
+      cachedIdToken = persisted;
+      cachedIdTokenExpiresAt =
+        Number(sessionStorage.getItem(TOKEN_EXPIRY_STORAGE_KEY) ?? "0") ||
+        now + 55 * 60 * 1000;
+      return persisted;
+    }
+  }
+
   if (idTokenFetchPromise) {
     return idTokenFetchPromise;
   }
@@ -102,7 +147,15 @@ export const ensureAuthToken = async (forceRefresh = false): Promise<string> => 
       const token = await user.getIdToken(forceRefresh);
       cachedIdToken = token;
       cachedIdTokenExpiresAt = decodeJwtExpiryMs(token) || now + 55 * 60 * 1000;
+      persistIdToken(token, cachedIdTokenExpiresAt);
       return token;
+    } catch (error) {
+      const code = (error as { code?: string })?.code;
+      if (!forceRefresh && code === "auth/quota-exceeded") {
+        const fallback = readPersistedIdToken() ?? cachedIdToken;
+        if (fallback) return fallback;
+      }
+      throw error;
     } finally {
       idTokenFetchPromise = null;
     }
@@ -110,6 +163,9 @@ export const ensureAuthToken = async (forceRefresh = false): Promise<string> => 
 
   return idTokenFetchPromise;
 };
+
+/** UID estável para o backend quando o Bearer token estiver indisponível. */
+export const getAuthenticatedUserId = (): string => auth.currentUser?.uid ?? "";
 
 // ==================== INTERFACES ====================
 

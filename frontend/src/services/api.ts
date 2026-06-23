@@ -9,7 +9,8 @@ import {
   getOrcamentoByUploadId,
   getAllOrcamentos,
   ensureAuthToken,
-  auth,
+  getAuthenticatedUserId,
+  waitForAuthReady,
 } from "./firebase";
 
 // Detectar URL da API
@@ -140,7 +141,13 @@ const parseApiError = (error: unknown, fallback: string): string => {
 
 const ANONYMOUS_USER_STORAGE_KEY = "thora_anonymous_user_id";
 
-const getAnonymousUserId = () => {
+/** ID enviado ao backend quando o Bearer token não está disponível. */
+const getRequestUserId = (): string => {
+  const firebaseUid = getAuthenticatedUserId();
+  if (firebaseUid) {
+    return firebaseUid;
+  }
+
   const existingUserId = window.localStorage.getItem(ANONYMOUS_USER_STORAGE_KEY);
   if (existingUserId) {
     return existingUserId;
@@ -196,8 +203,9 @@ apiClient.interceptors.response.use(
 
 // Attach Firebase ID token to protect backend endpoints.
 apiClient.interceptors.request.use(async (config) => {
+  await waitForAuthReady();
   config.headers = config.headers ?? {};
-  (config.headers as any)["X-Anonymous-User"] = getAnonymousUserId();
+  (config.headers as any)["X-Anonymous-User"] = getRequestUserId();
 
   try {
     const token = await ensureAuthToken();
@@ -206,30 +214,22 @@ apiClient.interceptors.request.use(async (config) => {
     }
   } catch (error) {
     const code = (error as { code?: string })?.code;
-    const isQuotaExceeded = code === "auth/quota-exceeded";
-
-    if (isQuotaExceeded) {
+    if (code === "auth/quota-exceeded") {
       console.warn(
-        "Cota Firebase Auth excedida; reutilizando token em cache se disponível.",
+        "Cota Firebase Auth excedida; usando UID da sessão e token em cache se houver.",
         error,
       );
       try {
         const cachedToken = await ensureAuthToken(false);
         if (cachedToken) {
           (config.headers as any).Authorization = `Bearer ${cachedToken}`;
-          return config;
         }
       } catch {
-        /* segue para fallback anônimo apenas sem sessão Firebase */
+        /* backend aceita X-Anonymous-User com UID Firebase */
       }
+    } else if (!getAuthenticatedUserId()) {
+      console.warn("Falha ao obter token Firebase; usando fallback anônimo.", error);
     }
-
-    if (auth.currentUser) {
-      console.error("Falha ao obter token Firebase com usuário autenticado.", error);
-      throw error;
-    }
-
-    console.warn("Falha ao obter token Firebase; usando fallback anônimo.", error);
   }
 
   return config;
@@ -338,21 +338,19 @@ export const detectOrcamentoTables = async (uploadId: string) => {
   const formData = new FormData();
   formData.append("upload_id", uploadId);
 
-  await ensureApiReady();
-
   let lastError: unknown;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const response = await apiClient.post("/api/orcamentos/detect-tables", formData, {
         headers: { "Content-Type": "multipart/form-data" },
-        timeout: 180000,
+        timeout: 300000,
       });
       return response.data as OrcamentoTableDetectResponse;
     } catch (error: unknown) {
       lastError = error;
       if (isRenderColdStartError(error) && attempt < 3) {
         await sleep(attempt * 5000);
-        await ensureApiReady();
+        await pingApiHealthLight();
         continue;
       }
       break;

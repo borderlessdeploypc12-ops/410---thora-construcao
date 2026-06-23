@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { pingApiHealth } from "../../services/api";
+import { pingApiHealthLight } from "../../services/api";
 import { getAbcBatchStatus, type AbcAnalysisJob } from "../../services/abcAnalysis";
 import {
   loadActiveAbcJobs,
@@ -22,12 +22,14 @@ export function useAbcBackgroundPoller(): void {
 
     const poll = async () => {
       if (pollingRef.current) return;
-      const uploadIds = loadActiveAbcJobs();
+      const uploadIds = loadActiveAbcJobs().filter(
+        (id) => id && !id.startsWith("pending-"),
+      );
       if (uploadIds.length === 0) return;
 
       pollingRef.current = true;
       try {
-        const apiUp = await pingApiHealth(slowPollRef.current ? 6 : 3);
+        const apiUp = await pingApiHealthLight();
         if (!apiUp || cancelled) {
           slowPollRef.current = true;
           return;

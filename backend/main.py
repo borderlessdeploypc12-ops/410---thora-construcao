@@ -2755,9 +2755,19 @@ async def abc_batch_status(
     jobs: list[Dict[str, Any]] = []
     for raw_id in payload.upload_ids:
         upload_id = _validate_upload_id(raw_id)
-        meta = _load_upload_meta(upload_id)
-        _assert_upload_access(user_id, meta.get("userId"), upload_id=upload_id)
-        jobs.append(_build_abc_job_status(upload_id))
+        try:
+            meta = _load_upload_meta(upload_id)
+            _assert_upload_access(user_id, meta.get("userId"), upload_id=upload_id)
+            jobs.append(_build_abc_job_status(upload_id))
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                logger.warning(
+                    "batch-status: acesso negado para %s (user=%s)",
+                    upload_id,
+                    user_id,
+                )
+                continue
+            raise
     return {"status": "success", "jobs": jobs}
 
 
