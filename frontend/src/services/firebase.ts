@@ -32,6 +32,32 @@ const analytics =
 // Firebase Auth (protects backend endpoints)
 const auth = getAuth(app);
 
+let cachedIdToken: string | null = null;
+let cachedIdTokenExpiresAt = 0;
+let idTokenFetchPromise: Promise<string> | null = null;
+
+const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
+
+const decodeJwtExpiryMs = (token: string): number => {
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1] ?? ""));
+    const exp = Number(payload.exp);
+    return Number.isFinite(exp) ? exp * 1000 : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const clearCachedIdToken = () => {
+  cachedIdToken = null;
+  cachedIdTokenExpiresAt = 0;
+  idTokenFetchPromise = null;
+};
+
+auth.onAuthStateChanged(() => {
+  clearCachedIdToken();
+});
+
 /** Aguarda Firebase Auth resolver a sessão (evita upload com usuário anônimo). */
 export const waitForAuthReady = (timeoutMs = 8000): Promise<void> =>
   new Promise((resolve) => {
@@ -53,10 +79,36 @@ export const waitForAuthReady = (timeoutMs = 8000): Promise<void> =>
     const timer = window.setTimeout(finish, timeoutMs);
   });
 
-export const ensureAuthToken = async (): Promise<string> => {
+export const ensureAuthToken = async (forceRefresh = false): Promise<string> => {
   await waitForAuthReady();
-  if (!auth.currentUser) return "";
-  return auth.currentUser.getIdToken(true);
+  const user = auth.currentUser;
+  if (!user) return "";
+
+  const now = Date.now();
+  if (
+    !forceRefresh &&
+    cachedIdToken &&
+    cachedIdTokenExpiresAt - TOKEN_REFRESH_MARGIN_MS > now
+  ) {
+    return cachedIdToken;
+  }
+
+  if (idTokenFetchPromise) {
+    return idTokenFetchPromise;
+  }
+
+  idTokenFetchPromise = (async () => {
+    try {
+      const token = await user.getIdToken(forceRefresh);
+      cachedIdToken = token;
+      cachedIdTokenExpiresAt = decodeJwtExpiryMs(token) || now + 55 * 60 * 1000;
+      return token;
+    } finally {
+      idTokenFetchPromise = null;
+    }
+  })();
+
+  return idTokenFetchPromise;
 };
 
 // ==================== INTERFACES ====================

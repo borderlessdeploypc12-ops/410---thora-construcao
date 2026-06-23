@@ -9,6 +9,7 @@ import {
   getOrcamentoByUploadId,
   getAllOrcamentos,
   ensureAuthToken,
+  auth,
 } from "./firebase";
 
 // Detectar URL da API
@@ -204,6 +205,30 @@ apiClient.interceptors.request.use(async (config) => {
       (config.headers as any).Authorization = `Bearer ${token}`;
     }
   } catch (error) {
+    const code = (error as { code?: string })?.code;
+    const isQuotaExceeded = code === "auth/quota-exceeded";
+
+    if (isQuotaExceeded) {
+      console.warn(
+        "Cota Firebase Auth excedida; reutilizando token em cache se disponível.",
+        error,
+      );
+      try {
+        const cachedToken = await ensureAuthToken(false);
+        if (cachedToken) {
+          (config.headers as any).Authorization = `Bearer ${cachedToken}`;
+          return config;
+        }
+      } catch {
+        /* segue para fallback anônimo apenas sem sessão Firebase */
+      }
+    }
+
+    if (auth.currentUser) {
+      console.error("Falha ao obter token Firebase com usuário autenticado.", error);
+      throw error;
+    }
+
     console.warn("Falha ao obter token Firebase; usando fallback anônimo.", error);
   }
 
