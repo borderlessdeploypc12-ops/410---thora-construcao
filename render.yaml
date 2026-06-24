@@ -25,6 +25,6 @@ services:
         value: gpt-4o
       - key: OPENAI_ORCAMENTO_TIMEOUT
         value: "120"
-      # OPENAI_API_KEY e GEMINI_API_KEY: defina SOMENTE no painel Render → Environment
-      # (não use sync:false no blueprint — pode impedir a injeção da chave no runtime)
-      # FIREBASE_CREDENTIALS (JSON da service account) — também via Environment / Secret File
+      - key: FIREBASE_STORAGE_BUCKET
+        value: borderless-5a4c8.firebasestorage.app
+      # OPENAI_API_KEY, GEMINI_API_KEY e FIREBASE_CREDENTIALS: defina no painel Render → Environment

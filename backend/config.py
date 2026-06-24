@@ -88,18 +88,34 @@ def _normalize_api_key(key: str) -> str:
     return "".join((key or "").split())
 
 
-def _read_env_secret_key(name: str) -> str:
-    """Lê variável de ambiente ou Secret File do Render (/etc/secrets/<name>)."""
-    raw = os.getenv(name)
-    if raw:
-        return _normalize_api_key(raw)
-    secret_path = Path("/etc/secrets") / name
-    if secret_path.is_file():
-        try:
-            return _normalize_api_key(secret_path.read_text(encoding="utf-8"))
-        except OSError:
-            pass
+def _read_env_secret_key(name: str, *, aliases: tuple[str, ...] = ()) -> str:
+    """Lê variável de ambiente, aliases ou Secret File do Render (/etc/secrets/<name>)."""
+    for key in (name, *aliases):
+        raw = os.getenv(key)
+        if raw:
+            return _normalize_api_key(raw)
+        file_env = os.getenv(f"{key}_FILE")
+        if file_env:
+            try:
+                return _normalize_api_key(Path(file_env).read_text(encoding="utf-8"))
+            except OSError:
+                pass
+        for secret_path in (
+            Path("/etc/secrets") / key,
+            Path("/var/secrets") / key,
+        ):
+            if secret_path.is_file():
+                try:
+                    return _normalize_api_key(secret_path.read_text(encoding="utf-8"))
+                except OSError:
+                    pass
     return ""
+
+
+def _scan_env_key_names() -> list[str]:
+    """Lista nomes de env vars relevantes (sem expor valores)."""
+    needles = ("OPENAI", "GEMINI", "FIREBASE", "RENDER", "ENVIRONMENT", "FRONTEND")
+    return sorted(k for k in os.environ if any(n in k.upper() for n in needles))
 
 
 # AI (Google Gemini)
@@ -113,7 +129,7 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-14b:free")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-OPENAI_API_KEY = _read_env_secret_key("OPENAI_API_KEY")
+OPENAI_API_KEY = _read_env_secret_key("OPENAI_API_KEY", aliases=("OPENAI_KEY",))
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # Fluxo Orçamento Analítico (GPT-4o) — chave via variável de ambiente (Render / .env local)
 OPENAI_ORCAMENTO_MODEL = os.getenv("OPENAI_ORCAMENTO_MODEL", "gpt-4o")
@@ -129,7 +145,9 @@ def _is_valid_env_key(key: str | None) -> bool:
 
 def get_openai_api_key() -> str:
     """Lê OPENAI_API_KEY em runtime (Render injeta via Environment, não usa .env)."""
-    return _read_env_secret_key("OPENAI_API_KEY") or _normalize_api_key(OPENAI_API_KEY)
+    return _read_env_secret_key("OPENAI_API_KEY", aliases=("OPENAI_KEY",)) or _normalize_api_key(
+        OPENAI_API_KEY
+    )
 
 
 def get_gemini_api_key() -> str:
@@ -174,14 +192,21 @@ def ai_keys_status() -> dict[str, object]:
     }
     if IS_RENDER or ENVIRONMENT == "production":
         openai_key = get_openai_api_key()
+        firebase_raw = os.getenv("FIREBASE_CREDENTIALS") or ""
         status["diagnostics"] = {
             "is_render": IS_RENDER,
             "render_service": os.getenv("RENDER_SERVICE_NAME", ""),
+            "environment_var": os.getenv("ENVIRONMENT", ""),
+            "frontend_url_set": bool(os.getenv("FRONTEND_URL")),
             "openai_env_var_length": len(os.getenv("OPENAI_API_KEY") or ""),
+            "openai_key_alias_length": len(os.getenv("OPENAI_KEY") or ""),
             "openai_normalized_length": len(openai_key),
             "openai_starts_with_sk": openai_key.startswith("sk-"),
+            "openai_secret_file": Path("/etc/secrets/OPENAI_API_KEY").is_file(),
             "openai_orcamento_model": os.getenv("OPENAI_ORCAMENTO_MODEL", ""),
             "orcamento_timeout_set": bool(os.getenv("OPENAI_ORCAMENTO_TIMEOUT")),
+            "firebase_credentials_length": len(firebase_raw),
+            "matching_env_keys": _scan_env_key_names(),
         }
     return status
 
