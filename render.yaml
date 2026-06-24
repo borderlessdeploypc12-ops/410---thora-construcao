@@ -21,9 +21,10 @@ services:
         value: https://borderless-410-thora.netlify.app,https://borderles-410.netlify.app,https://410-thora.netlify.app
       - key: RENDER
         value: "true"
-      # Obrigatório para extração com IA (defina o valor no painel Render → Environment):
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: GEMINI_API_KEY
-        sync: false
+      - key: OPENAI_ORCAMENTO_MODEL
+        value: gpt-4o
+      - key: OPENAI_ORCAMENTO_TIMEOUT
+        value: "120"
+      # OPENAI_API_KEY e GEMINI_API_KEY: defina SOMENTE no painel Render → Environment
+      # (não use sync:false no blueprint — pode impedir a injeção da chave no runtime)
       # FIREBASE_CREDENTIALS (JSON da service account) — também via Environment / Secret File

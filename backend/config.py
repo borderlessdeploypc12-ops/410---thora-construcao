@@ -5,12 +5,19 @@ from dotenv import load_dotenv
 
 # Paths
 BASE_DIR = Path(__file__).resolve().parent
-# .env na raiz do repo e em backend/ (não depender só do diretório de trabalho ao rodar `py main.py`)
-load_dotenv(BASE_DIR.parent / ".env")
-load_dotenv(BASE_DIR / ".env")
-load_dotenv()
+
+# Detectar plataforma ANTES do dotenv (Render injeta RENDER / RENDER_SERVICE_NAME no processo)
 IS_VERCEL = os.getenv("VERCEL", "").strip().lower() in {"1", "true", "yes", "on"}
-IS_RENDER = os.getenv("RENDER", "").strip().lower() in {"1", "true", "yes", "on"}
+IS_RENDER = (
+    os.getenv("RENDER", "").strip().lower() in {"1", "true", "yes", "on"}
+    or bool(os.getenv("RENDER_SERVICE_NAME") or os.getenv("RENDER_SERVICE_ID"))
+)
+
+# Em Render/Vercel usar só variáveis da plataforma — evita .env local vazio sobrescrever nada
+if not IS_VERCEL and not IS_RENDER:
+    load_dotenv(BASE_DIR.parent / ".env")
+    load_dotenv(BASE_DIR / ".env")
+    load_dotenv()
 RUNTIME_BASE_DIR = Path("/tmp") if (IS_VERCEL or IS_RENDER) else BASE_DIR
 UPLOAD_FOLDER = RUNTIME_BASE_DIR / "uploads"
 TEMP_FOLDER = RUNTIME_BASE_DIR / "temp"
@@ -64,26 +71,6 @@ API_TITLE = "Automação de Orçamentos"
 API_VERSION = "1.0.0"
 API_DESCRIPTION = "API para processar e gerar orçamentos de obras"
 
-# AI (Google Gemini)
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-
-# AI fallback providers (OpenAI-compatible APIs)
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-14b:free")
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-# Fluxo Orçamento Analítico (GPT-4o) — chave via variável de ambiente (Render / .env local)
-OPENAI_ORCAMENTO_MODEL = os.getenv("OPENAI_ORCAMENTO_MODEL", "gpt-4o")
-_default_orcamento_timeout = "55" if IS_VERCEL else "120"
-OPENAI_ORCAMENTO_TIMEOUT_SECONDS = float(
-    os.getenv("OPENAI_ORCAMENTO_TIMEOUT", _default_orcamento_timeout)
-)
-
 _PLACEHOLDER_API_KEYS = frozenset(
     {
         "",
@@ -96,19 +83,58 @@ _PLACEHOLDER_API_KEYS = frozenset(
 )
 
 
+def _normalize_api_key(key: str) -> str:
+    """Remove quebras de linha e espaços acidentais ao colar chaves no painel Render."""
+    return "".join((key or "").split())
+
+
+def _read_env_secret_key(name: str) -> str:
+    """Lê variável de ambiente ou Secret File do Render (/etc/secrets/<name>)."""
+    raw = os.getenv(name)
+    if raw:
+        return _normalize_api_key(raw)
+    secret_path = Path("/etc/secrets") / name
+    if secret_path.is_file():
+        try:
+            return _normalize_api_key(secret_path.read_text(encoding="utf-8"))
+        except OSError:
+            pass
+    return ""
+
+
+# AI (Google Gemini)
+GEMINI_API_KEY = _read_env_secret_key("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+# AI fallback providers (OpenAI-compatible APIs)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-14b:free")
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+OPENAI_API_KEY = _read_env_secret_key("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Fluxo Orçamento Analítico (GPT-4o) — chave via variável de ambiente (Render / .env local)
+OPENAI_ORCAMENTO_MODEL = os.getenv("OPENAI_ORCAMENTO_MODEL", "gpt-4o")
+_default_orcamento_timeout = "55" if IS_VERCEL else "120"
+OPENAI_ORCAMENTO_TIMEOUT_SECONDS = float(
+    os.getenv("OPENAI_ORCAMENTO_TIMEOUT", _default_orcamento_timeout)
+)
+
 def _is_valid_env_key(key: str | None) -> bool:
-    normalized = (key or "").strip().lower()
+    normalized = _normalize_api_key(key or "").lower()
     return bool(normalized) and normalized not in _PLACEHOLDER_API_KEYS
 
 
 def get_openai_api_key() -> str:
     """Lê OPENAI_API_KEY em runtime (Render injeta via Environment, não usa .env)."""
-    return (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY or "").strip()
+    return _read_env_secret_key("OPENAI_API_KEY") or _normalize_api_key(OPENAI_API_KEY)
 
 
 def get_gemini_api_key() -> str:
     """Lê GEMINI_API_KEY em runtime."""
-    return (os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY or "").strip()
+    return _read_env_secret_key("GEMINI_API_KEY") or _normalize_api_key(GEMINI_API_KEY)
 
 
 def is_openai_configured() -> bool:
@@ -139,13 +165,25 @@ def ai_keys_status() -> dict[str, object]:
             )
         else:
             hint = "Defina OPENAI_API_KEY ou GEMINI_API_KEY no .env (raiz ou backend/)."
-    return {
+    status: dict[str, object] = {
         "openai_configured": is_openai_configured(),
         "gemini_configured": is_gemini_configured(),
         "extraction_provider": provider,
         "configured": configured,
         "hint": hint,
     }
+    if IS_RENDER or ENVIRONMENT == "production":
+        openai_key = get_openai_api_key()
+        status["diagnostics"] = {
+            "is_render": IS_RENDER,
+            "render_service": os.getenv("RENDER_SERVICE_NAME", ""),
+            "openai_env_var_length": len(os.getenv("OPENAI_API_KEY") or ""),
+            "openai_normalized_length": len(openai_key),
+            "openai_starts_with_sk": openai_key.startswith("sk-"),
+            "openai_orcamento_model": os.getenv("OPENAI_ORCAMENTO_MODEL", ""),
+            "orcamento_timeout_set": bool(os.getenv("OPENAI_ORCAMENTO_TIMEOUT")),
+        }
+    return status
 
 # AI local provider (Ollama)
 _default_ollama_enabled = "false" if IS_VERCEL else "true"
@@ -209,6 +247,10 @@ else:
     print("AVISO: GEMINI_API_KEY não encontrada ou inválida")
 
 if is_openai_configured():
-    print("OPENAI_API_KEY carregada")
+    print(f"OPENAI_API_KEY carregada (len={len(get_openai_api_key())})")
 elif not is_gemini_configured():
-    print("AVISO: configure OPENAI_API_KEY ou GEMINI_API_KEY no ambiente (Render ou .env local)")
+    raw_len = len(os.getenv("OPENAI_API_KEY") or "")
+    print(
+        "AVISO: configure OPENAI_API_KEY ou GEMINI_API_KEY no ambiente "
+        f"(Render ou .env local; OPENAI_API_KEY raw len={raw_len})"
+    )
