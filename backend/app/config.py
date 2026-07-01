@@ -19,8 +19,9 @@ if not IS_VERCEL and not IS_RENDER:
 RUNTIME_BASE_DIR = Path("/tmp/thora") if (IS_VERCEL or IS_RENDER) else BASE_DIR / "data"
 UPLOAD_DIR = RUNTIME_BASE_DIR / "uploads"
 CACHE_DIR = RUNTIME_BASE_DIR / "cache"
+TEMP_DIR = RUNTIME_BASE_DIR / "temp"
 
-for folder in (UPLOAD_DIR, CACHE_DIR):
+for folder in (UPLOAD_DIR, CACHE_DIR, TEMP_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")

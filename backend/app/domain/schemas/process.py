@@ -18,10 +18,11 @@ class ProcessTablesResponse(BaseModel):
     tables_found: int
     items_found: int
     analysis_types: list[str]
-    engine: str = "budget_parser"
+    engine: str = "openai_hybrid"
     tables: list[dict[str, Any]] = Field(default_factory=list)
     items: list[dict[str, Any]] = Field(default_factory=list)
     structured_items: list[dict[str, Any]] = Field(default_factory=list)
     hierarchical_items: list[dict[str, Any]] = Field(default_factory=list)
     resumo: dict[str, Any] = Field(default_factory=dict)
+    ia_metadata: dict[str, Any] = Field(default_factory=dict)
     message: str = ""

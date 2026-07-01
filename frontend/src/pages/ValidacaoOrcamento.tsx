@@ -255,16 +255,26 @@ function buildItemExportPayload(items: ItemOrcamento[]): Record<string, unknown>
   return items.map((item) => ({
     id: String(item.id),
     item: item.item ?? "",
+    item_numero: item.item ?? "",
     tipo: item.tipo ?? "item",
     banco: item.banco ?? "",
-    codigo: item.code,
+    codigo: item.catalogCode ?? "",
+    catalogCode: item.catalogCode ?? "",
+    code: item.item ?? item.code,
     descricao: item.description,
+    description: item.description,
     unidade: item.unit,
+    unit: item.unit,
     quantidade: item.qty,
+    qty: item.qty,
     valor_unitario: item.unitPrice,
+    unitPrice: item.unitPrice,
     valor_total: item.lineTotal,
+    lineTotal: item.lineTotal,
+    totalValue: item.lineTotal,
     bdi: item.bdi,
     classification: item.classification,
+    individual_percentage: item.individual_percentage,
     accumulated_percentage: item.accumulated_percentage,
   }));
 }
@@ -776,7 +786,7 @@ export default function ValidacaoOrcamento() {
     setIsExporting(true);
     try {
       await exportOrcamentoExcel({
-        flatItems: items,
+        flatItems: buildItemExportPayload(items),
         modelosSelecionados: CURVA_ABC_ONLY,
         nomeProjeto: nomeProjetoExport,
       });

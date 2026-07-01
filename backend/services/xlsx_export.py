@@ -235,13 +235,33 @@ def prepare_analitico_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _extract_catalog_code(raw: Dict[str, Any]) -> str:
+    catalog = str(
+        raw.get("catalogCode")
+        or raw.get("catalog_code")
+        or raw.get("codigo_catalogo")
+        or ""
+    ).strip()
+    item_numero = str(raw.get("item") or raw.get("item_numero") or "").strip()
+    codigo = str(raw.get("codigo") or "").strip()
+    if catalog:
+        return catalog
+    if codigo and codigo != item_numero:
+        return codigo
+    return ""
+
+
 def prepare_curva_abc_rows(items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], float]:
     """Ordenação por valor decrescente + percentuais e classificação A/B/C."""
     prepared: List[Dict[str, Any]] = []
     for raw in items:
         if not isinstance(raw, dict) or not _is_executive_row(raw):
             continue
-        prepared.append(_normalize_base_row(raw))
+        row = _normalize_base_row(raw)
+        row["item_numero"] = str(raw.get("item") or raw.get("item_numero") or "").strip()
+        row["banco"] = str(raw.get("banco") or "").strip()
+        row["catalog_code"] = _extract_catalog_code(raw)
+        prepared.append(row)
 
     prepared.sort(key=lambda row: row["total_com_bdi"], reverse=True)
     total_geral = sum(row["total_com_bdi"] for row in prepared)
@@ -496,39 +516,85 @@ def _fill_analitico_sheet(ws, rows: List[Dict[str, Any]]) -> None:
     gerar_aba_analitica(ws, rows)
 
 
-def _fill_curva_abc_sheet(ws, rows: List[Dict[str, Any]], total_geral: float) -> None:
+def _fill_curva_abc_sheet(
+    ws,
+    rows: List[Dict[str, Any]],
+    total_geral: float,
+    *,
+    nome_projeto: str | None = None,
+) -> None:
+    from datetime import datetime
+
+    title_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    title_font = Font(bold=True, color="FFFFFF", size=14)
+    subtitle_font = Font(size=10, color="64748B", italic=True)
+
+    ws.merge_cells("A1:L1")
+    title_cell = ws["A1"]
+    title_cell.value = "Curva ABC — Análise de Pareto"
+    title_cell.font = title_font
+    title_cell.fill = title_fill
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    ws.merge_cells("A2:L2")
+    subtitle = nome_projeto or "Orçamento de Obras"
+    ws["A2"].value = f"{subtitle} · Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    ws["A2"].font = subtitle_font
+    ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 18
+
+    header_row = 4
     headers = [
+        "Item",
+        "Banco",
         "Código",
         "Descrição",
         "BDI (%)",
-        "Unidade",
+        "Un.",
         "Quantidade",
-        "Valor Unitário C/BDI",
-        "Valor Total C/BDI",
-        "%",
-        "Acumulado",
-        "Class.",
+        "V. Unit. C/BDI",
+        "V. Total C/BDI",
+        "% Individual",
+        "% Acumulado",
+        "Classe",
     ]
-    _write_header_row(ws, headers)
-    right_cols = {3, 5, 6, 7, 8, 9}
-    center_cols = {4, 10}
+    for col_num, header in enumerate(headers, 1):
+        cell = ws.cell(row=header_row, column=col_num)
+        cell.value = header
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = THIN_BORDER
+    ws.row_dimensions[header_row].height = 30
+    ws.freeze_panes = f"A{header_row + 1}"
+
+    right_cols = {5, 7, 8, 9, 10, 11}
+    center_cols = {1, 2, 3, 6, 12}
 
     for idx, row_data in enumerate(rows):
-        row_num = idx + 2
+        row_num = header_row + 1 + idx
         stripe = ZEBRA_LIGHT if idx % 2 == 0 else ZEBRA_WHITE
+        cls = str(row_data.get("classification") or "").strip().upper()
+        row_fill = CLASS_FILLS.get(cls, stripe)
+
         values = [
-            row_data["code"],
-            row_data["description"],
-            row_data["bdi"],
-            row_data["unit"],
-            row_data["qty"],
-            row_data["unit_com_bdi"],
-            row_data["total_com_bdi"],
+            row_data.get("item_numero") or row_data.get("code") or "",
+            row_data.get("banco") or "",
+            row_data.get("catalog_code") or "",
+            row_data.get("description") or "",
+            row_data.get("bdi", 0),
+            row_data.get("unit") or "",
+            row_data.get("qty", 0),
+            row_data.get("unit_com_bdi", 0),
+            row_data.get("total_com_bdi", 0),
             row_data.get("percent", 0),
             row_data.get("accumulated", 0),
-            row_data.get("classification", ""),
+            cls,
         ]
         formats = [
+            None,
+            None,
             None,
             None,
             '0.00"%"',
@@ -546,13 +612,15 @@ def _fill_curva_abc_sheet(ws, rows: List[Dict[str, Any]], total_geral: float) ->
             cell.border = THIN_BORDER
             if formats[col_num - 1]:
                 cell.number_format = formats[col_num - 1]
-            if col_num == 10:
-                cls = str(row_data.get("classification") or "").strip().upper()
-                cell.fill = CLASS_FILLS.get(cls, stripe)
+            if col_num == 12:
+                cell.fill = CLASS_FILLS.get(cls, row_fill)
                 cell.font = CLASS_FONTS.get(cls, Font(bold=True))
                 cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif col_num == 4:
+                cell.fill = row_fill
+                cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
             else:
-                cell.fill = stripe
+                cell.fill = row_fill
                 if col_num in right_cols:
                     cell.alignment = Alignment(horizontal="right", vertical="center")
                 elif col_num in center_cols:
@@ -560,29 +628,77 @@ def _fill_curva_abc_sheet(ws, rows: List[Dict[str, Any]], total_geral: float) ->
                 else:
                     cell.alignment = Alignment(horizontal="left", vertical="center")
 
-    total_row = len(rows) + 3
-    ws.cell(row=total_row, column=6).value = "TOTAL GERAL:"
-    ws.cell(row=total_row, column=6).font = TOTAL_FONT
-    ws.cell(row=total_row, column=6).alignment = Alignment(horizontal="right")
-    ws.cell(row=total_row, column=7).value = total_geral
-    ws.cell(row=total_row, column=7).number_format = "#,##0.00"
-    ws.cell(row=total_row, column=7).fill = TOTAL_FILL
-    ws.cell(row=total_row, column=7).font = TOTAL_FONT
-    ws.cell(row=total_row, column=7).border = THIN_BORDER
+    data_end = header_row + len(rows)
+    total_row = data_end + 2
+    ws.cell(row=total_row, column=8).value = "TOTAL GERAL:"
+    ws.cell(row=total_row, column=8).font = TOTAL_FONT
+    ws.cell(row=total_row, column=8).alignment = Alignment(horizontal="right")
+    total_cell = ws.cell(row=total_row, column=9)
+    total_cell.value = total_geral
+    total_cell.number_format = "#,##0.00"
+    total_cell.fill = TOTAL_FILL
+    total_cell.font = TOTAL_FONT
+    total_cell.border = THIN_BORDER
+
+    summary_start = total_row + 2
+    ws.cell(row=summary_start, column=1).value = "Resumo por classe"
+    ws.cell(row=summary_start, column=1).font = Font(bold=True, size=11, color="1F4E78")
+
+    summary_headers = ["Classe", "Qtd. Itens", "Valor Total", "% do Total"]
+    for col_offset, label in enumerate(summary_headers):
+        cell = ws.cell(row=summary_start + 1, column=1 + col_offset)
+        cell.value = label
+        cell.font = Font(bold=True, size=10)
+        cell.fill = PatternFill(start_color="E2E8F0", end_color="E2E8F0", fill_type="solid")
+        cell.border = THIN_BORDER
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    class_stats: Dict[str, Dict[str, float]] = {
+        "A": {"count": 0, "total": 0.0},
+        "B": {"count": 0, "total": 0.0},
+        "C": {"count": 0, "total": 0.0},
+    }
+    for row_data in rows:
+        cls = str(row_data.get("classification") or "C").strip().upper()
+        if cls not in class_stats:
+            cls = "C"
+        class_stats[cls]["count"] += 1
+        class_stats[cls]["total"] += float(row_data.get("total_com_bdi") or 0)
+
+    for offset, cls in enumerate(("A", "B", "C")):
+        row_num = summary_start + 2 + offset
+        stats = class_stats[cls]
+        pct = (stats["total"] / total_geral * 100.0) if total_geral > 0 else 0.0
+        values = [cls, int(stats["count"]), stats["total"], pct]
+        formats = [None, "0", "#,##0.00", '0.00"%"']
+        for col_offset, (value, fmt) in enumerate(zip(values, formats)):
+            cell = ws.cell(row=row_num, column=1 + col_offset)
+            cell.value = value
+            cell.border = THIN_BORDER
+            cell.fill = CLASS_FILLS.get(cls, ZEBRA_WHITE)
+            cell.font = CLASS_FONTS.get(cls, Font())
+            if fmt:
+                cell.number_format = fmt
+            cell.alignment = Alignment(
+                horizontal="right" if col_offset > 0 else "center",
+                vertical="center",
+            )
 
     _apply_col_widths(
         ws,
         {
-            "A": 14,
-            "B": 48,
-            "C": 10,
-            "D": 10,
-            "E": 12,
-            "F": 16,
-            "G": 16,
-            "H": 10,
-            "I": 12,
-            "J": 8,
+            "A": 10,
+            "B": 16,
+            "C": 14,
+            "D": 46,
+            "E": 9,
+            "F": 8,
+            "G": 12,
+            "H": 14,
+            "I": 16,
+            "J": 12,
+            "K": 12,
+            "L": 9,
         },
     )
 
@@ -692,7 +808,7 @@ def build_export_workbook(
         abc_rows, total_geral = prepare_curva_abc_rows(items)
         if abc_rows:
             ws = wb.create_sheet("Curva ABC")
-            _fill_curva_abc_sheet(ws, abc_rows, total_geral)
+            _fill_curva_abc_sheet(ws, abc_rows, total_geral, nome_projeto=nome_projeto)
             sheets_created.append("Curva ABC")
 
     if not sheets_created:
@@ -1154,5 +1270,6 @@ def save_export_workbook(
             stem = safe
     filename = f"{stem}_{uuid.uuid4().hex[:8]}.xlsx"
     file_path = temp_folder / filename
+    temp_folder.mkdir(parents=True, exist_ok=True)
     wb.save(file_path)
     return file_path, filename

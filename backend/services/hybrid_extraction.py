@@ -88,8 +88,49 @@ def _find_parser_match(
             if descricao in p_desc or p_desc[:60] in descricao:
                 return parser_item
 
+    ai_q = round(_coerce_number(ai_item.get("quantidade")), 4)
+    ai_vt = round(_coerce_number(ai_item.get("valor_total")), 2)
+    if ai_vt > 0:
+        for parser_item in parser_items:
+            p_q = round(_coerce_number(parser_item.get("quantidade")), 4)
+            p_vt = round(_coerce_number(parser_item.get("valor_total")), 2)
+            if abs(p_q - ai_q) < 0.02 and abs(p_vt - ai_vt) < 1.0:
+                return parser_item
+
     if 0 <= index < len(parser_items):
         return parser_items[index]
+    return None
+
+
+def _find_ai_match_for_parser(
+    parser_item: Dict[str, Any],
+    ai_items: List[Dict[str, Any]],
+    index: int,
+) -> Dict[str, Any] | None:
+    codigo = _normalize_codigo(parser_item.get("codigo"))
+    if codigo:
+        for ai_item in ai_items:
+            if _normalize_codigo(ai_item.get("codigo")) == codigo:
+                return ai_item
+
+    p_desc = str(parser_item.get("descricao") or "").strip().lower()[:60]
+    if p_desc:
+        for ai_item in ai_items:
+            ai_desc = str(ai_item.get("descricao") or "").strip().lower()
+            if p_desc in ai_desc or ai_desc[:60] in p_desc:
+                return ai_item
+
+    p_q = round(_coerce_number(parser_item.get("quantidade")), 4)
+    p_vt = round(_coerce_number(parser_item.get("valor_total")), 2)
+    if p_vt > 0:
+        for ai_item in ai_items:
+            ai_q = round(_coerce_number(ai_item.get("quantidade")), 4)
+            ai_vt = round(_coerce_number(ai_item.get("valor_total")), 2)
+            if abs(p_q - ai_q) < 0.02 and abs(p_vt - ai_vt) < 1.0:
+                return ai_item
+
+    if 0 <= index < len(ai_items) and isinstance(ai_items[index], dict):
+        return ai_items[index]
     return None
 
 
@@ -152,24 +193,13 @@ def merge_parser_as_primary(
     if not parser_items:
         return ai_items
 
-    ai_by_code: dict[str, Dict[str, Any]] = {}
-    for ai_item in ai_items:
-        if not isinstance(ai_item, dict):
-            continue
-        codigo = _normalize_codigo(ai_item.get("codigo"))
-        if codigo:
-            ai_by_code[codigo] = ai_item
-
     merged: List[Dict[str, Any]] = []
     for index, parser_item in enumerate(parser_items):
         if not isinstance(parser_item, dict):
             continue
 
         row = dict(parser_item)
-        codigo = _normalize_codigo(row.get("codigo"))
-        ai_match = ai_by_code.get(codigo)
-        if ai_match is None and index < len(ai_items) and isinstance(ai_items[index], dict):
-            ai_match = ai_items[index]
+        ai_match = _find_ai_match_for_parser(parser_item, ai_items, index)
 
         if ai_match:
             ai_desc = str(ai_match.get("descricao") or "").strip()
@@ -192,10 +222,19 @@ def merge_parser_as_primary(
         confianca, validation_alerts = score_item_confidence(row)
         row["confianca"] = confianca
         row["alertas"] = validation_alerts
+        row.setdefault("tipo_linha", "item")
+        row.setdefault("tipo", "item")
         row["origem_extracao"] = "parser_local_enriquecido_ia" if ai_match else "parser_local"
         merged.append(row)
 
     return merged
+
+
+def _looks_hierarchical_item_numero(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return bool(re.match(r"^\d+(?:\.\d+)+$", text))
 
 
 def merge_ai_with_parser(
@@ -240,6 +279,24 @@ def merge_ai_with_parser(
 
             if not str(row.get("codigo") or "").strip() and parser_match.get("codigo"):
                 row["codigo"] = parser_match.get("codigo")
+
+            parser_item_numero = str(
+                parser_match.get("item_numero") or parser_match.get("item") or ""
+            ).strip()
+            ai_item_numero = str(row.get("item_numero") or row.get("item") or "").strip()
+            if parser_item_numero and (
+                not ai_item_numero
+                or (
+                    _looks_hierarchical_item_numero(parser_item_numero)
+                    and not _looks_hierarchical_item_numero(ai_item_numero)
+                )
+            ):
+                row["item_numero"] = parser_item_numero
+                row["item"] = parser_item_numero
+
+            parser_banco = str(parser_match.get("banco") or "").strip()
+            if parser_banco:
+                row["banco"] = parser_banco
 
         confianca, validation_alerts = score_item_confidence(row)
         all_alerts = merge_alerts + validation_alerts

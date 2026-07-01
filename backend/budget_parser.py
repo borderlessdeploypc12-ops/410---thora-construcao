@@ -346,6 +346,35 @@ class BudgetParser:
             "valor_total": valor_total,
         }
 
+    def parse_table_row_scan(self, rows: List[List[Any]], page: int = 0) -> List[Dict[str, Any]]:
+        """Varredura linha a linha (NOVACAP) sem depender de cabeçalho ou colunas fixas."""
+        items: List[Dict[str, Any]] = []
+        for idx, row in enumerate(rows):
+            if not row or self.is_header_row(row) or self.should_ignore_row(row):
+                continue
+            parsed = self.try_parse_novacap_row(row) or self.try_parse_loose_text_row(row)
+            if not parsed:
+                continue
+            items.append(
+                {
+                    "id": f"item_{page}_{idx}",
+                    "item_numero": parsed.get("item_numero"),
+                    "item": parsed.get("item_numero"),
+                    "banco": parsed.get("banco"),
+                    "codigo": parsed.get("codigo"),
+                    "descricao": parsed.get("descricao"),
+                    "quantidade": parsed.get("quantidade"),
+                    "unidade": parsed.get("unidade"),
+                    "bdi": parsed.get("bdi"),
+                    "valor_unitario": parsed.get("valor_unitario"),
+                    "valor_total": parsed.get("valor_total"),
+                    "status": "validado",
+                    "origem": f"página {page}, linha {idx}",
+                }
+            )
+        logger.info("Varredura NOVACAP: %s itens na página %s", len(items), page)
+        return items
+
     def _merge_row_fields(
         self,
         primary: Dict[str, Any],

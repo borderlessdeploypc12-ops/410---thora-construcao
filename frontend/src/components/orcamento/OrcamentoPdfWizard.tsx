@@ -523,19 +523,7 @@ export function OrcamentoPdfWizard({
       const mappedOptions = mapTableCandidates(detectResponse.options || []);
 
       setTableOptions(mappedOptions);
-      const recommendedIds = (detectResponse.recommended_table_ids || []).filter((id) =>
-        mappedOptions.some((option) => option.id === id),
-      );
-      const likelyIds = mappedOptions
-        .filter((option) => option.is_budget_likely)
-        .map((option) => option.id);
-      const defaultSelected =
-        recommendedIds.length > 0
-          ? recommendedIds
-          : likelyIds.length > 0
-            ? likelyIds.slice(0, 5)
-            : mappedOptions.slice(0, 3).map((option) => option.id);
-      setSelectedTableIds(defaultSelected);
+      setSelectedTableIds([]);
       setSelectedAnalysisTypes(["curva_abc"]);
       if (mappedOptions.length === 0) {
         setPhase("pick_file");
@@ -549,10 +537,7 @@ export function OrcamentoPdfWizard({
       }
       setPhase("selecting_table");
       toast.success("Tabelas encontradas", {
-        description:
-          defaultSelected.length > 0
-            ? `${defaultSelected.length} tabela(s) de orçamento pré-selecionada(s). Confira a seleção antes de continuar.`
-            : "Selecione as tabelas de orçamento detalhado para continuar.",
+        description: `${mappedOptions.length} tabela(s) detectada(s). Selecione manualmente as planilhas de orçamento para continuar.`,
       });
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : "Erro ao processar arquivo";
@@ -594,7 +579,7 @@ export function OrcamentoPdfWizard({
     }
 
     setPhase("processing_ai");
-    setProcessingDetail("Extraindo itens das tabelas selecionadas…");
+    setProcessingDetail("IA analisando tabelas selecionadas…");
     setProgressPercent(10);
     setErrorMessage("");
 
@@ -636,9 +621,13 @@ export function OrcamentoPdfWizard({
         uploadId,
         {
           ...result,
-          structured_items: result.structured_items ?? result.items,
-          hierarchical_items: result.hierarchical_items ?? result.items,
-          ia_metadata: { engine: result.engine, analysis_types: result.analysis_types },
+          items: result.items ?? result.structured_items,
+          structured_items: result.items ?? result.structured_items,
+          hierarchical_items: result.items ?? result.hierarchical_items ?? result.structured_items,
+          ia_metadata: result.ia_metadata ?? {
+            engine: result.engine,
+            analysis_types: result.analysis_types,
+          },
         },
         file,
         selectedTableIds,

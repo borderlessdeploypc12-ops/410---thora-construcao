@@ -15,8 +15,8 @@ async def process_orcamento_tables(
     payload: ProcessTablesRequest,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Extrai e analisa tabelas selecionadas com parser local (sem IA)."""
-    result = process_selected_tables(
+    """Extrai e analisa tabelas selecionadas com OpenAI (híbrido + parser local)."""
+    result = await process_selected_tables(
         payload.upload_id,
         user_id,
         payload.table_ids,

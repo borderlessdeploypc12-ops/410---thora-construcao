@@ -1,6 +1,6 @@
 """
-Extração determinística de itens orçamentários a partir de tabelas selecionadas.
-Usa BudgetParser — sem IA no caminho principal.
+Extração de itens orçamentários a partir de tabelas selecionadas.
+Usa OpenAI (híbrido com parser local) para análise precisa; fallback para BudgetParser.
 """
 
 from __future__ import annotations
@@ -10,7 +10,10 @@ import re
 from typing import Any
 
 from budget_parser import BudgetParser
+from config import OPENAI_ORCAMENTO_MODEL, is_openai_configured
 from fastapi import HTTPException
+from services.hybrid_extraction import merge_parser_as_primary
+from services.openai_service import OpenAIServiceError, process_selected_table
 
 from app.infrastructure.storage.table_cache_store import TableCacheStore
 from app.infrastructure.storage.upload_store import UploadStore
@@ -231,6 +234,9 @@ def _items_from_table_rows(
 ) -> list[dict[str, Any]]:
     parser = BudgetParser()
     parsed_items, _ = parser.parse_table(rows, page=page)
+    row_scan_items = parser.parse_table_row_scan(rows, page=page)
+    if len(row_scan_items) > len(parsed_items):
+        parsed_items = row_scan_items
     template_sem_precos = _rows_likely_missing_prices(rows)
     structured: list[dict[str, Any]] = []
 
@@ -253,23 +259,52 @@ def _items_from_table_rows(
     return structured
 
 
+def _item_completeness_score(item: dict[str, Any]) -> int:
+    score = 0
+    if str(item.get("codigo") or "").strip():
+        score += 4
+    item_numero = str(item.get("item_numero") or item.get("item") or "").strip()
+    if re.match(r"^\d+\.\d+\.\d+", item_numero):
+        score += 3
+    elif re.match(r"^\d+\.\d+", item_numero):
+        score += 2
+    if str(item.get("banco") or "").strip():
+        score += 1
+    return score
+
+
+def _normalize_codigo(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().upper())
+
+
+def _dedup_key(item: dict[str, Any]) -> str | None:
+    """Chave de deduplicação: só aplica quando há código; item_numero distingue linhas do edital."""
+    codigo = _normalize_codigo(item.get("codigo"))
+    if not codigo:
+        return None
+    item_numero = str(item.get("item_numero") or item.get("item") or "").strip()
+    return f"{codigo}::{item_numero}" if item_numero else codigo
+
+
 def _deduplicate_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[tuple[str, str, str, str, float, float]] = set()
     result: list[dict[str, Any]] = []
+    index_by_key: dict[str, int] = {}
+
     for raw in items:
-        source = str(raw.get("_source_table_id") or "").strip().lower()
-        item_numero = str(raw.get("item_numero") or raw.get("item") or "").strip().lower()
-        codigo = str(raw.get("codigo") or "").strip().lower()
-        descricao = str(raw.get("descricao") or "").strip().lower()[:120]
-        quantidade = round(_coerce_number(raw.get("quantidade")), 4)
-        valor_unitario = round(_coerce_number(raw.get("valor_unitario")), 2)
-        key = (source, item_numero, codigo, descricao, quantidade, valor_unitario)
-        if key in seen:
+        if not str(raw.get("codigo") or "").strip() and not str(raw.get("descricao") or "").strip():
             continue
-        if not codigo and not descricao:
+        key = _dedup_key(raw)
+        if key is None:
+            result.append(raw)
             continue
-        seen.add(key)
-        result.append(raw)
+        if key in index_by_key:
+            idx = index_by_key[key]
+            if _item_completeness_score(raw) > _item_completeness_score(result[idx]):
+                result[idx] = raw
+        else:
+            index_by_key[key] = len(result)
+            result.append(raw)
+
     return result
 
 
@@ -302,6 +337,56 @@ def _candidate_page(candidate: dict[str, Any]) -> int:
     return int(candidate.get("num_pagina") or candidate.get("pagina") or 1)
 
 
+def _items_all_missing_prices(items: list[Any]) -> bool:
+    executive: list[dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        tipo = str(raw.get("tipo_linha") or raw.get("tipo") or "item").lower()
+        desc = str(raw.get("descricao") or "").lower()
+        if tipo == "grupo" or "total do grupo" in desc:
+            continue
+        executive.append(raw)
+    if not executive:
+        return False
+    missing = sum(
+        1
+        for it in executive
+        if _coerce_number(it.get("valor_unitario")) <= 0
+        and _coerce_number(it.get("valor_total")) <= 0
+    )
+    return missing >= max(1, len(executive) // 2)
+
+
+def _parser_has_reliable_structure(parser_items: list[dict[str, Any]]) -> bool:
+    if len(parser_items) < 3:
+        return False
+    structured = 0
+    for item in parser_items:
+        if str(item.get("codigo") or "").strip():
+            structured += 1
+            continue
+        item_numero = str(item.get("item_numero") or item.get("item") or "").strip()
+        if re.match(r"^\d+(?:\.\d+)+$", item_numero):
+            structured += 1
+    return structured >= max(3, int(len(parser_items) * 0.4))
+
+
+def _should_use_parser_as_primary(
+    parser_items: list[dict[str, Any]],
+    ai_items: list[dict[str, Any]],
+    *,
+    template_sem_precos: bool,
+) -> bool:
+    if not parser_items:
+        return False
+    if template_sem_precos or _items_all_missing_prices(ai_items):
+        return True
+    if _parser_has_reliable_structure(parser_items):
+        return True
+    return len(parser_items) >= max(3, int(len(ai_items) * 0.5))
+
+
 def _resolve_rows(candidate: dict[str, Any]) -> list[list[Any]]:
     rows = candidate.get("rows")
     if not isinstance(rows, list) or not rows:
@@ -318,12 +403,21 @@ def _resolve_rows(candidate: dict[str, Any]) -> list[list[Any]]:
     return rows
 
 
-def process_selected_tables(
+async def process_selected_tables(
     upload_id: str,
     user_id: str,
     table_ids: list[str],
     analysis_types: list[str],
 ) -> dict[str, Any]:
+    if not is_openai_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "A chave da OpenAI não está configurada. "
+                "Defina OPENAI_API_KEY no ambiente para análise com IA."
+            ),
+        )
+
     upload_store = UploadStore()
     upload_id = UploadStore.validate_upload_id(upload_id)
     upload_store.assert_access(upload_id, user_id)
@@ -348,14 +442,28 @@ def process_selected_tables(
         )
 
     all_structured: list[dict[str, Any]] = []
+    all_hierarchical: list[dict[str, Any]] = []
     tables_out: list[dict[str, Any]] = []
+    ia_metadata_list: list[dict[str, Any]] = []
+    pdf_bytes: bytes | None = None
+
+    def _pdf_bytes_for_table(*, has_table_image: bool) -> bytes:
+        nonlocal pdf_bytes
+        if has_table_image:
+            return b""
+        if pdf_bytes is None:
+            pdf_bytes = upload_store.ensure_pdf(upload_id).read_bytes()
+        return pdf_bytes
 
     for table_id in table_ids:
         candidate = by_id[table_id]
         rows = _resolve_rows(candidate)
         page = _candidate_page(candidate)
-        structured = _items_from_table_rows(rows, page=page, table_id=table_id)
-        all_structured.extend(structured)
+        candidate_name = str(candidate.get("nome_tabela") or "")
+        table_image_b64 = candidate.get("imagem_base64")
+        template_sem_precos = _rows_likely_missing_prices(rows)
+        parser_items = _items_from_table_rows(rows, page=page, table_id=table_id)
+
         tables_out.append(
             {
                 "page": page,
@@ -363,14 +471,92 @@ def process_selected_tables(
                 "rows": rows,
                 "original_rows": len(rows),
                 "columns": len(rows[0]) if rows else 0,
-                "items_parsed": len(structured),
+                "items_parsed": 0,
             }
         )
+
+        try:
+            structured_data, provider_used = await process_selected_table(
+                _pdf_bytes_for_table(has_table_image=bool(table_image_b64)),
+                table_id,
+                table_rows=rows,
+                table_page=page,
+                table_name=candidate_name or None,
+                table_image_base64=table_image_b64,
+            )
+        except OpenAIServiceError as exc:
+            logger.warning("Erro IA na tabela %s: %s", table_id, exc)
+            raise HTTPException(
+                status_code=getattr(exc, "status_code", 500) or 500,
+                detail=f"Erro na extração IA da tabela {table_id}: {exc}",
+            ) from exc
+
+        items_this_table = structured_data.get("items") or []
+        hierarchical_this_table = structured_data.get("hierarchical_items") or []
+
+        if not items_this_table:
+            logger.warning(
+                "IA retornou 0 itens para %s (pág %s). Usando parser local.",
+                table_id,
+                page,
+            )
+            items_this_table = parser_items
+            if items_this_table:
+                ia_metadata_list.append(
+                    {
+                        "table_id": table_id,
+                        "provider": "local:budget_parser_fallback",
+                        "resumo": {"total_items": len(items_this_table)},
+                    }
+                )
+        elif _should_use_parser_as_primary(
+            parser_items,
+            items_this_table,
+            template_sem_precos=template_sem_precos,
+        ):
+            logger.info(
+                "Parser como base estrutural (%s itens) + IA (%s itens) em %s",
+                len(parser_items),
+                len(items_this_table),
+                table_id,
+            )
+            items_this_table = merge_parser_as_primary(parser_items, items_this_table)
+            ia_metadata_list.append(
+                {
+                    "table_id": table_id,
+                    "provider": "local:parser_primary_hibrido",
+                    "resumo": {"total_items": len(items_this_table)},
+                }
+            )
+        else:
+            ia_metadata_list.append(
+                {
+                    "table_id": table_id,
+                    "provider": provider_used,
+                    "resumo": structured_data.get("resumo") or {},
+                }
+            )
+
+        for raw_item in items_this_table:
+            if isinstance(raw_item, dict):
+                raw_item.setdefault("origem_extracao", "openai_hybrid")
+                raw_item.setdefault("_source_table_id", table_id)
+                raw_item.setdefault("_source_page", page)
+        for raw_item in hierarchical_this_table:
+            if isinstance(raw_item, dict):
+                raw_item.setdefault("_source_table_id", table_id)
+                raw_item.setdefault("_source_page", page)
+
+        all_structured.extend(items_this_table)
+        all_hierarchical.extend(items_this_table)
+        tables_out[-1]["items_parsed"] = len(items_this_table)
+
         logger.info(
-            "Parser local: tabela %s pág %s → %s itens",
+            "IA híbrida: tabela %s pág %s → %s itens (%s)",
             table_id,
             page,
-            len(structured),
+            len(items_this_table),
+            provider_used,
         )
 
     deduped = _deduplicate_items(all_structured)
@@ -388,11 +574,13 @@ def process_selected_tables(
             ),
         )
 
+    hierarchical_deduped = deduped
+
     valor_total = sum(_coerce_number(i.get("valor_total")) for i in filtered)
     resumo = {
         "total_items": len(filtered),
         "valor_total": round(valor_total, 2),
-        "metodo": "budget_parser",
+        "metodo": OPENAI_ORCAMENTO_MODEL,
         "analysis_types": analysis_types,
     }
 
@@ -403,14 +591,20 @@ def process_selected_tables(
         "tables_found": len(tables_out),
         "items_found": len(filtered),
         "analysis_types": analysis_types,
-        "engine": "budget_parser",
+        "engine": "openai_hybrid",
         "tables": tables_out,
         "items": filtered,
-        "structured_items": filtered,
-        "hierarchical_items": filtered,
+        "structured_items": hierarchical_deduped,
+        "hierarchical_items": hierarchical_deduped,
         "resumo": resumo,
+        "ia_metadata": {
+            "tables_processed": len(ia_metadata_list),
+            "details": ia_metadata_list,
+            "model": OPENAI_ORCAMENTO_MODEL,
+            "engine_used": "openai_hybrid",
+        },
         "message": (
-            f"{len(filtered)} item(ns) extraídos por análise local "
-            f"({', '.join(analysis_types)})."
+            f"{len(filtered)} item(ns) extraídos com IA ({OPENAI_ORCAMENTO_MODEL}) "
+            f"— {', '.join(analysis_types)}."
         ),
     }

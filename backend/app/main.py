@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import abc_stubs, analise, health, process, tables, uploads
+from app.api.routes import abc_stubs, analise, export, health, process, tables, uploads
 from app.config import (
     API_DESCRIPTION,
     API_TITLE,
@@ -35,6 +35,7 @@ def create_app() -> FastAPI:
     application.include_router(uploads.router)
     application.include_router(tables.router)
     application.include_router(process.router)
+    application.include_router(export.router)
     application.include_router(abc_stubs.router)
     application.include_router(analise.router)
 
